@@ -15,6 +15,7 @@ import { existsSync } from 'node:fs'
 import { WORKBUDDY_CONNECT_VERSION } from '../core/version.ts'
 import { WORKBUDDY_VARIANTS, variantFor, type WorkBuddyVariant } from '../core/variants.ts'
 import { WorkBuddyBridge } from './bridge.ts'
+import { probeChatTurn } from './account-probe.ts'
 import {
   bridgeDescriptorPath,
   readBridgeDescriptor,
@@ -301,10 +302,24 @@ async function serve(args: ParsedArgs): Promise<void> {
   // The UI listens on its own ephemeral loopback port rather than sharing the
   // shim's: the shim's surface is fixed by the upstream and adding a page to it
   // would be the one thing this port promised not to do.
+  //
+  // The wslUrls map is declared here — before the forwarders that fill it —
+  // because the state closure reads it at request time, so the URLs appear on
+  // the page the moment they are bound.
+  const wslUrls = new Map<string, string>()
   let ui: WorkBuddyUiServer | undefined
   if (args.ui) {
     ui = createWorkBuddyUiServer({
-      state: () => bridge.uiState(),
+      state: async () => {
+        const state = await bridge.uiState()
+        return {
+          ...state,
+          endpoints: state.endpoints.map(endpoint => {
+            const wsl = wslUrls.get(endpoint.provider)
+            return wsl === undefined ? endpoint : { ...endpoint, wslBaseUrl: wsl }
+          }),
+        }
+      },
       probe: request => bridge.probePoolMember(request),
       logger,
     })
@@ -317,7 +332,6 @@ async function serve(args: ParsedArgs): Promise<void> {
   // bridge bound to loopback — the failure is a bare connection refusal.
   const wslHosts = wslHostAddresses()
   const forwarders: WslForwarder[] = []
-  const wslUrls = new Map<string, string>()
   let uiWslUrl: string | undefined
   if (args.wsl && wslHosts[0] === undefined) {
     console.warn('workbuddy-bridge: --wsl was given but no WSL virtual switch was found; nothing extra to expose')
@@ -482,39 +496,14 @@ interface ChatProbeResult {
  * chain works — shim gates, credential resolution, upstream acceptance — and a
  * failure carries the upstream's own words instead of a classification of them.
  *
- * The body is minimal on purpose: the shim forces streaming and prepends the
- * system prompt itself, so anything larger would test the caller rather than
- * the bridge.
+ * The request itself lives in `account-probe.ts`, shared with the web UI's
+ * per-account test button: the two ask the same question of the same endpoint,
+ * and two copies of the SSE parse would eventually disagree about what a pass
+ * looks like.
  */
 async function chatProbe(route: string, baseUrl: string, token: string, model: string): Promise<ChatProbeResult> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => { controller.abort() }, CHAT_PROBE_TIMEOUT_MS)
-  try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        messages: [{ role: 'user', content: 'Reply with the single word: ok' }],
-        max_tokens: 8,
-      }),
-      signal: controller.signal,
-    })
-    const text = await response.text()
-    if (!response.ok) {
-      return { route, baseUrl, ok: false, detail: `HTTP ${response.status}: ${text.slice(0, 400)}` }
-    }
-    const delta = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(text)
-    const parts = [`HTTP ${response.status}`, `${text.length} bytes`]
-    if (text.includes('[DONE]')) parts.push('terminated')
-    parts.push(delta === null ? 'no text delta' : `first text: ${(delta[1] ?? '').slice(0, 60)}`)
-    return { route, baseUrl, ok: true, detail: parts.join(', ') }
-  } catch (error: unknown) {
-    return { route, baseUrl, ok: false, detail: messageOf(error) }
-  } finally {
-    clearTimeout(timer)
-  }
+  const result = await probeChatTurn({ baseUrl, token, model, timeoutMs: CHAT_PROBE_TIMEOUT_MS })
+  return { route, baseUrl, ok: result.ok, detail: result.detail }
 }
 
 /**

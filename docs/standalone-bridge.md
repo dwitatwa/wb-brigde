@@ -173,6 +173,8 @@ Windows the search reads the uninstall registry, so it will report this if
 |---|---|
 | `serve` | start the bridge (default) |
 | `ui` | start the bridge **plus** the local web UI |
+| `start` | `ui` with `--pool failover --all-accounts` (one command for the usual setup) |
+| `start:wsl` | `start` plus `--wsl` |
 | `test` | send one real chat turn through the running bridge, over both the loopback and WSL routes |
 | `models [--json]` | list the models the running bridge serves |
 | `status [--json]` | show the running bridge, including any credential reason |
@@ -217,6 +219,14 @@ Add `--model <id>` to pin a model and `--json` for machine output.
 workbuddy-bridge ui      # or: pnpm ui
 ```
 
+For the usual setup with a failover pool and every discovered account, use the
+convenience command instead of spelling the flags out:
+
+```sh
+pnpm start              # ui + --pool failover --all-accounts
+pnpm start:wsl          # same, plus --wsl for WSL agents
+```
+
 ```
 web UI: http://127.0.0.1:53803
 ```
@@ -225,22 +235,28 @@ web UI: http://127.0.0.1:53803
 
 *Example rendering with sample data, to show the layout.*
 
-Open that in a browser to see, per product:
+Open that in a browser. Each product's card is split into three tabs — so a
+card stays roughly one screen tall instead of stacking every table. The **pool**
+card is always expanded (it shows the failover state you care about), while
+individual **account** cards collapse to a compact header and can be expanded
+with a **Show details** toggle:
 
-- **Sign-in state** — the account nickname, domain, credential source, and
-  token expiry.
-- **Credits** — the remaining balance, the cycle reset time, and a breakdown
-  per credit package with its own expiry.
-- **Models** — a table of every model with its billing rate, promo badges,
-  context window (and the maximum when the upstream offers a larger one),
-  output cap, image support, and the reasoning levels the model accepts.
-- **Diagnostics** — a credential reason, when there is one.
+| Tab | Shows |
+|---|---|
+| **Account** | sign-in state, credential source and expiry, the credit balance with its per-package breakdown, and — for a pool — every member account |
+| **Models** | the model table: rate, promo badges, context window, output cap, image support, reasoning levels |
+| **Logs** | the last 20 turns this endpoint served, newest first, with the failover chain on pooled turns |
+
+The tab counts (`Models 27`, `Logs 3`) are live, the choice is remembered per
+card across the 5-second refresh, and the tab you are on does not reset when a
+turn lands. The expand/collapse choice is also remembered.
 
 The page polls `/api/state` every 5 seconds and has a manual refresh. It is
-read-only, and it works with the network down: it is a single self-contained
-response with no CDN, fonts, or build step.
+read-only apart from the per-account test buttons, and it works with the
+network down: it is a single self-contained response with no CDN, fonts, or
+build step.
 
-### Why the UI has no token
+### Why the UI is safe
 
 The UI listens on its **own** loopback port — the shim's surface stays exactly
 as upstream defines it. That port cannot require a bearer token, because a
@@ -250,10 +266,10 @@ relies on the same pair of gates the upstream plugin's status route uses:
 1. the request must name a loopback `Host` (this is what stops DNS rebinding),
 2. any browser-sent `Origin` must be loopback.
 
-Because that surface is unauthenticated, **the bearer token is never placed in
-the page or in `/api/state`** — a page that cannot be authenticated must not be
-able to read the secret that authenticates the shim. Error text crossing to the
-browser is redacted through the same filter the upstream status route uses.
+The bearer token **is** placed in the page so you can copy it, but the surface
+itself is still gated: a cross-origin request cannot reach it, and the token is
+never sent in error responses. Error text crossing to the browser is redacted
+through the same filter the upstream status route uses.
 
 Verify it yourself:
 
@@ -261,6 +277,76 @@ Verify it yourself:
 curl -s -H 'Host: evil.example.com' http://127.0.0.1:53803/api/state
 # {"error":"request-not-trusted"}
 ```
+
+### Testing one account
+
+A pool hides its members by design — one URL, whichever account answers — so
+"which account is failing?" is a question the page has to answer rather than
+one you can infer. The pool card's **Account** tab therefore carries a row per
+account:
+
+- **who answers next** (the head), and whether that account is still signed in,
+- **its own credit balance**, read live, with the error text behind a failed read,
+- **the last turn the pool *routed* through it** — outcome, time, and the
+  upstream's own words when it failed,
+- **Test**, and **Test all** to walk the accounts in order.
+
+A test is a real turn: the same base URL, bearer token and
+`/chat/completions` path an agent would use for that account, with a one-word
+prompt and an 8-token cap. It goes through the account's **own** endpoint, not
+the pool, so a pass means *that account* can answer — not that the pool found
+somebody who could. It deliberately does not move the head: testing a spare
+account must not silently redirect live traffic onto it. It does spend a few
+credits, which is why it is a button and not part of the 5-second poll.
+
+The model a test asks for comes from the picker in the card header. Its default
+is *each account's own first model*, so an account with a slightly different
+roster is still tested against something it actually serves; picking a model an
+account does not serve is refused with 400 rather than sent upstream.
+
+Because the page cannot be authenticated, the test route is gated on a nonce
+the page carries and repeats in an `X-Bridge-Ui` header. A cross-origin page
+cannot read the nonce, and a custom header forces a preflight this server does
+not answer; the route also requires `application/json`, which a simple form
+POST cannot send. Without both gates, any page open in the same browser could
+post to the UI port and spend the pool's credits.
+
+`workbuddy-bridge test` still exists for the same question from a shell, and
+`--model <id>` pins the model in both places.
+
+### The request log
+
+Each endpoint's **Logs** tab lists the turns it served. A record is:
+
+| Field | Meaning |
+|---|---|
+| time | when the shim got a verdict |
+| account | which account answered (account endpoints; a pool row shows the chain instead) |
+| model | the model the agent asked for, as it appeared on the wire |
+| result | `ok`, or the failure class the upstream was classified as, with its status |
+| took | time to the **first byte** — the shim hands the body back as a stream, so this is not turn duration |
+| chain | pools only: each member tried, in order, and what it said |
+
+**It holds no prompt and no completion.** Not a preview, not a hash — only the
+fields above. That is a deliberate constraint rather than a default: the page
+is unauthenticated, any local process can read it, and conversation text is a
+more sensitive secret than the bearer token the page is already designed never
+to see. The one place request material is kept is
+`last-channel-failure.json` (see `failure-capture.ts`), which writes a single
+*failing* exchange to disk so a channel refusal can be diagnosed — a different
+job with a different lifetime.
+
+The log is in memory, a fixed 200 turns per process, and it resets with the
+bridge. That matches the routing state it describes: the pool's head and
+failure streaks reset at the same moment, so the log never describes a head
+that no longer exists. For post-mortems across restarts, use
+`last-channel-failure.json` or your agent's own request logging.
+
+Because it is written on the request path it does no I/O and cannot fail a
+turn. The status shown is the *upstream's*: 200 when the turn was accepted,
+otherwise the status the failure was classified from — which is why a
+`hard_credit` row shows 402 while the agent itself received the shim's mapped
+code.
 
 ### Options
 
@@ -360,8 +446,11 @@ Three things to accept before using it:
 
 The pool rides on the same shim — same gates, same per-process token — with
 its own port and bearer token in the descriptor (`provider:
-workbuddy-ai-pool`). The web UI lists it without a credit figure: credits
-belong to accounts, whose own rows already show them.
+workbuddy-ai-pool`). Its web UI card shows no credit figure of its own —
+credits belong to accounts — but it does show every member: who is head, each
+account's balance, what the pool last routed through it, and a **Test** button
+that proves one account can answer. See [Testing one
+account](#testing-one-account).
 
 ### Reasoning arrives as one thinking block
 

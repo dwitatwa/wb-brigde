@@ -109,6 +109,242 @@ declare function readBridgeDescriptor(): Promise<BridgeDescriptor | undefined>;
  */
 declare function removeBridgeDescriptor(pid?: number): Promise<void>;
 //#endregion
+//#region src/standalone/account-probe.d.ts
+/**
+ * One real chat turn against one loopback endpoint, as evidence.
+ *
+ * "This account is signed in and has credits" is not the same claim as "this
+ * account can answer a turn": the credential can be present while the
+ * upstream refuses it, the model can be listed while the account's channel is
+ * rejected, and the shim's gates can fail for reasons none of the read-only
+ * checks see. The only honest test is the one an agent performs, so this
+ * sends exactly that — same base URL, same bearer token, same
+ * `/chat/completions` path — and reports the upstream's own words when it
+ * fails.
+ *
+ * The body is minimal on purpose: the shim forces streaming and prepends the
+ * system prompt itself, so anything larger would test the caller rather than
+ * the account.
+ *
+ * @module workbuddy-bridge/standalone/account-probe
+ */
+/** How long one probe turn may take before it is abandoned. */
+declare const CHAT_PROBE_TIMEOUT_MS = 60000;
+/** What to probe: one endpoint plus the credential it accepts. */
+interface ChatProbeOptions {
+  /**
+   * The OpenAI-compatible base URL, **including** the `/v1` suffix — the same
+   * string the descriptor publishes and an agent is configured with. Getting
+   * this wrong is not a subtle failure: the shim answers `/chat/completions`
+   * with its own 404, which reads exactly like an upstream refusal.
+   */
+  baseUrl: string;
+  /** That shim's bearer token — the one an agent would be configured with. */
+  token: string;
+  /** The model to ask for; must be one this endpoint serves. */
+  model: string;
+  /** Override the default timeout, in milliseconds. */
+  timeoutMs?: number;
+  /** Caller cancellation, e.g. the browser hanging up mid-turn. */
+  signal?: AbortSignal;
+}
+/** What one probe produced, in the terms a user needs to read. */
+interface ChatProbeResult {
+  ok: boolean;
+  /** HTTP status, or 0 when the request never completed. */
+  status: number;
+  /** Wall time from request to the last byte of the answer. */
+  latencyMs: number;
+  /** A short factual account: status, size, termination, first text — or the error. */
+  detail: string;
+}
+/**
+ * Send one minimal streaming chat turn and classify what came back.
+ *
+ * Never throws: a refused connection, a timeout and a 402 are all answers to
+ * "can this account serve a turn", and the caller renders them the same way.
+ */
+declare function probeChatTurn(options: ChatProbeOptions): Promise<ChatProbeResult>;
+//#endregion
+//#region src/standalone/pool.d.ts
+/**
+ * The store surface the pool needs from each member. Structural, so tests
+ * can stand in stubs; the real bridge passes each account runtime's pieces.
+ */
+interface WorkBuddyPoolMember {
+  /** Resolves this member's credential, refreshing it when due. */
+  store: Pick<WorkBuddyCredentialStore, 'resolve'>;
+  /** Sends this member's chat turn upstream. */
+  client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
+}
+/**
+ * Upstream failure classes where a different account could plausibly
+ * succeed, and are therefore worth failing over on:
+ *
+ * - `hard_credit` — this account's quota is gone; another account's is not
+ * - `soft_rate` — this account is throttled; another is not
+ * - `session_dead` — this credential cannot be renewed; another may be fine
+ * - `server` — a 5xx may be account-scoped (per-account channel state), and
+ *   retrying the identical request on another account is what the upstream's
+ *   own 「请重新发送」 advice asks for
+ *
+ * Everything else stays on the failing member: a `client` (400) failure is a
+ * property of the *request*, so every account would answer it identically,
+ * and a transport error is a property of the *network*, which is shared.
+ */
+declare const POOL_FAILOVER_KINDS: ReadonlySet<UpstreamErrorKind>;
+/** Why a pool member could not be attempted, surfaced for diagnosis. */
+interface WorkBuddyPoolAttempt {
+  /** Position in the member list, 0-based. */
+  index: number;
+  /** What this member's attempt produced, or why it was skipped. */
+  outcome: {
+    state: 'ok';
+  } | {
+    state: 'credential-error';
+    message: string;
+  } | {
+    state: 'upstream-error';
+    status: number;
+    kind: UpstreamErrorKind;
+    message: string;
+  };
+}
+/**
+ * What the pool has observed about one member's traffic.
+ *
+ * Exists for the UI: a pool is one endpoint over several accounts, so the
+ * only way an operator can see *which* account is carrying the load — or
+ * which one has started failing — is for the router to remember. Counts are
+ * since process start; nothing here is persisted, because a restart genuinely
+ * resets the head and the evidence that shaped it.
+ */
+interface WorkBuddyPoolMemberHealth {
+  /** Position in the member list, 0-based — what a test request names. */
+  index: number;
+  /** When this member was last attempted, or 0 before any traffic. */
+  lastAttemptAtMs: number;
+  /** The last attempt's outcome, or undefined before any traffic. */
+  lastOutcome?: WorkBuddyPoolAttempt['outcome'];
+  /** Failures since this member last succeeded; what makes it look unhealthy. */
+  consecutiveFailures: number;
+  /** Turns this member served successfully. */
+  successes: number;
+  /** Attempts on this member that failed. */
+  failures: number;
+}
+/**
+ * One pool endpoint's request router.
+ *
+ * Implements the two pieces the shim consumes — `store.resolve()` and
+ * `client.chatStream()` — over the member list. `resolve()` exists only as
+ * the shim's signed-in existence check: it answers with the head member's
+ * credential when any member has one, so a pool where every account is
+ * signed out still produces the shim's 401 rather than a confused 500. The
+ * real per-attempt credential resolution happens inside {@link chatStream}.
+ */
+declare class WorkBuddyFailoverPool {
+  private readonly members;
+  /** Where the next request starts; advances past failed members. */
+  private head;
+  /** Per-member traffic record, parallel to `members`. */
+  private readonly observed;
+  constructor(members: readonly WorkBuddyPoolMember[]);
+  /** How many accounts the pool can draw from. */
+  get size(): number;
+  /** The member that will answer the next request, 0-based. */
+  headIndex(): number;
+  /** A copy of each member's traffic record, in member order. */
+  memberHealth(): readonly WorkBuddyPoolMemberHealth[];
+  /** The shim's signed-in existence check: any member's credential will do. */
+  resolve(): Promise<WorkBuddyCredential>;
+  /**
+   * Send one chat turn through the pool.
+   *
+   * The `credential` argument is the shim's resolved head credential and is
+   * deliberately ignored: each attempt resolves its own member's credential,
+   * because the whole point is that the answering account is chosen by the
+   * failure pattern, not by whoever happened to be head when the request
+   * arrived. Returns the first success; otherwise the last failure seen.
+   */
+  chatStream(_credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal, onAttempt?: (attempt: WorkBuddyPoolAttempt) => void): Promise<WorkBuddyChatResult>;
+  /**
+   * Fold one attempt into that member's record.
+   *
+   * Recorded by the router itself rather than by the caller's `onAttempt`
+   * hook, because the UI reads it whether or not anybody is listening to the
+   * hook — and a record that only exists when a diagnostic is attached would
+   * be empty exactly when an operator first opens the page.
+   */
+  private note;
+}
+//#endregion
+//#region src/standalone/request-log.d.ts
+/** How many turns one process remembers. */
+declare const REQUEST_LOG_LIMIT = 200;
+/** How many rows one endpoint's card shows. */
+declare const REQUEST_ROWS_PER_CARD = 20;
+/** One member's part in a pooled turn. */
+interface WorkBuddyRequestAttempt {
+  /** The account's nickname, or a positional label. */
+  account: string;
+  /** `ok`, a failure class, or the account's credential refusing to resolve. */
+  outcome: 'ok' | 'credential-error' | UpstreamErrorKind;
+  /** The upstream's status for a failed attempt. */
+  status?: number;
+}
+/** One turn, as the log remembers it. */
+interface WorkBuddyRequestRecord {
+  /** Monotonic id, so two identical-looking turns stay distinguishable. */
+  id: number;
+  atMs: number;
+  /**
+   * Stable key of the endpoint the agent addressed: `<provider>#<account>` for
+   * an account endpoint, `<provider>-pool` for a pool. Two accounts of one
+   * product share a provider id, so the account has to be part of the key.
+   */
+  endpoint: string;
+  /** The account that answered, for an endpoint that fronts one account. */
+  account?: string;
+  model: string;
+  /** The upstream's status: 200 when the turn was accepted. */
+  status: number;
+  outcome: 'ok' | UpstreamErrorKind;
+  /** Wall time until the shim had a verdict — the first byte, not the last. */
+  latencyMs: number;
+  /** The failover chain, in attempt order; present only when more than one was tried. */
+  attempts?: readonly WorkBuddyRequestAttempt[];
+}
+/** Pull `model` out of a request body without assuming it parses. */
+declare function modelOfBody(bodyJson: string): string;
+/**
+ * Flatten one pool attempt for the log.
+ *
+ * The attempt's message is dropped deliberately: it is upstream error text
+ * that can echo request material, and `failure-capture.ts` already keeps it
+ * for the failures that need it. What survives is the class and the status,
+ * which is what makes a chain readable.
+ */
+declare function attemptRecord(attempt: WorkBuddyPoolAttempt, labelOf: (index: number) => string): WorkBuddyRequestAttempt;
+/**
+ * A fixed-size ring of recent turns, newest last.
+ *
+ * `record()` is called on the hot path of every request, so it does no I/O and
+ * cannot throw: a log that fails a turn would be worse than no log.
+ */
+declare class WorkBuddyRequestLog {
+  private readonly limit;
+  private readonly entries;
+  private nextId;
+  constructor(limit?: number);
+  /** How many turns are remembered. */
+  get size(): number;
+  /** Add one turn, dropping the oldest when the ring is full. */
+  record(input: Omit<WorkBuddyRequestRecord, 'id' | 'atMs'>): WorkBuddyRequestRecord;
+  /** One endpoint's most recent turns, newest first. */
+  recent(endpoint: string, limit?: number): readonly WorkBuddyRequestRecord[];
+}
+//#endregion
 //#region src/standalone/ui.d.ts
 /** One credit package, as the UI shows it. */
 interface UiCreditAccount {
@@ -147,12 +383,71 @@ interface UiModel {
     canDisableThinking?: boolean;
   };
 }
-/** One served endpoint, as the UI shows it. Never carries the bearer token. */
+/** One member of a failover pool, as the UI shows it. */
+interface UiPoolMember {
+  /** Position in the pool's member list, 0-based — what a test request names. */
+  index: number;
+  /** 1-based position among the product's accounts. */
+  accountIndex: number;
+  /** The account's nickname, or a positional label while none is known. */
+  label: string;
+  /** The account uid (email or user id), when known. */
+  uid?: string;
+  signedIn: boolean;
+  /** The account's own endpoint, so a row can be matched to its card. */
+  baseUrl: string;
+  /** Whether this member will answer the next request. */
+  head: boolean;
+  /** Turns this member served successfully since the bridge started. */
+  successes: number;
+  /** Attempts on this member that failed. */
+  failures: number;
+  /** Failures since this member last succeeded. */
+  consecutiveFailures: number;
+  lastAttemptAtMs?: number;
+  /** The last attempt's class, for a status pill. */
+  lastOutcome?: 'ok' | 'credential-error' | 'upstream-error';
+  /** One line describing the last attempt. */
+  lastOutcomeDetail?: string;
+  credits?: UiCredits;
+  creditsError?: string;
+}
+/**
+ * A pool's membership, as one block on its card.
+ *
+ * Carried on the endpoint rather than as separate endpoint rows because a
+ * pool member is not addressable the way an account is: its credits, its
+ * failures and its test result only mean anything in relation to the pool
+ * that routes to it.
+ */
+interface UiPool {
+  /** Which member answers next, 0-based. */
+  headIndex: number;
+  members: readonly UiPoolMember[];
+}
+/**
+ * One recent turn, as a card shows it.
+ *
+ * The record's internal `id` and `endpoint` key are dropped: the card *is* the
+ * endpoint, and the id exists to keep two identical-looking turns apart in the
+ * log, not to be rendered.
+ */
+type UiRequestRow = Omit<WorkBuddyRequestRecord, 'id' | 'endpoint'>;
+/** One served endpoint, as the UI shows it. */
 interface UiEndpoint {
   provider: string;
   displayName: string;
   /** The OpenAI-compatible base URL an agent would use. */
   baseUrl: string;
+  /**
+   * The WSL-facing base URL, when `--wsl` re-exposes this endpoint on the
+   * WSL virtual switch. Absent when the bridge runs without `--wsl`.
+   */
+  wslBaseUrl?: string;
+  /** The bearer token for this endpoint — shown so the user can copy it. */
+  token?: string;
+  /** The account uid (email or user id), when known. */
+  uid?: string;
   signedIn: boolean;
   nickname?: string;
   domain?: string;
@@ -167,6 +462,10 @@ interface UiEndpoint {
   credits?: UiCredits;
   creditsError?: string;
   models: readonly UiModel[];
+  /** Present only on a failover pool: its members and who answers next. */
+  pool?: UiPool;
+  /** The most recent turns this endpoint served, newest first. Metadata only. */
+  requests: readonly UiRequestRow[];
 }
 /** The whole document `/api/state` returns. */
 interface UiState {
@@ -174,6 +473,40 @@ interface UiState {
   startedAtMs: number;
   nowMs: number;
   endpoints: readonly UiEndpoint[];
+}
+/** What the page asks the bridge to test: one pool member. */
+interface UiProbeRequest {
+  /** The pool endpoint's provider id, e.g. `workbuddy-ai-pool`. */
+  provider: string;
+  /** 0-based member index within that pool. */
+  index: number;
+  /** Model to test with; the account's first model when absent. */
+  model?: string;
+}
+/** What one probe produced, attributed back to the member that was asked. */
+interface UiProbeResult {
+  provider: string;
+  index: number;
+  /** The account's nickname, so a result can be read without the page. */
+  label: string;
+  model: string;
+  ok: boolean;
+  /** HTTP status, or 0 when the turn never completed. */
+  status: number;
+  latencyMs: number;
+  detail: string;
+}
+/**
+ * A request the caller got wrong, with the status to answer it with.
+ *
+ * Separate from an ordinary `Error` because "there is no pool at that
+ * provider" and "the upstream refused this account" are different answers: the
+ * first is a 404 the page should surface as a bug, the second is a 200 with
+ * `ok: false` and is the whole point of the feature.
+ */
+declare class UiRequestError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string);
 }
 /** A running UI server. */
 interface WorkBuddyUiServer {
@@ -188,6 +521,13 @@ interface WorkBuddyUiServer {
 interface WorkBuddyUiOptions {
   /** Build the current state document. Called per request. */
   state: () => Promise<UiState>;
+  /**
+   * Test one pool member with a real chat turn.
+   *
+   * Absent means the page renders without test buttons — a read-only UI, which
+   * is what an embedder that cannot afford upstream calls should pass.
+   */
+  probe?: (request: UiProbeRequest) => Promise<UiProbeResult>;
   logger?: ShimLogger;
 }
 /**
@@ -252,6 +592,13 @@ interface BridgeOptions {
    * stream exactly as received.
    */
   coalesceReasoning?: boolean;
+  /**
+   * Send one probe turn. Defaults to the real loopback chat probe.
+   *
+   * Injectable so a test can answer without an upstream, and so an embedder
+   * can substitute a cheaper check.
+   */
+  probe?: (options: ChatProbeOptions) => Promise<ChatProbeResult>;
 }
 /**
  * Both variants' loopback endpoints, running for the life of the process.
@@ -264,6 +611,10 @@ declare class WorkBuddyBridge {
   private readonly runtimes;
   private readonly pools;
   private readonly options;
+  /** Probe keys (`provider#index`) currently in flight, so a double click cannot double-spend. */
+  private readonly probes;
+  /** The turns agents have sent, for the UI. Metadata only, in memory, bounded. */
+  private readonly requests;
   private timer;
   private stopped;
   private startedAtMs;
@@ -274,6 +625,15 @@ declare class WorkBuddyBridge {
    * untouched, so error handling is unaffected.
    */
   private finishChat;
+  /**
+   * Record one turn against the endpoint the agent addressed.
+   *
+   * Metadata only: the body is parsed for its model name and then dropped, so
+   * the log never holds a prompt. Called on the request path, therefore free
+   * of I/O — and it cannot fail a turn, because the log is worth less than the
+   * request it describes.
+   */
+  private noteTurn;
   /**
    * Bring up every variant's endpoint and publish the descriptor.
    *
@@ -299,20 +659,37 @@ declare class WorkBuddyBridge {
   /** Current endpoints, without touching disk. */
   endpoints(): BridgeEndpoint[];
   /**
-   * Build the web UI's state document.
-   *
-   * Deliberately carries **no bearer token**. The UI page cannot be
-   * authenticated — a browser navigation cannot attach an `Authorization`
-   * header — so it must not be able to read the secret that authenticates the
-   * shim. Only the model list, credit balance, and sign-in identity cross here.
+   * Build the web UI's state document. Carries the bearer token so the user
+   * can copy it from the pool card. The page itself is still unauthenticated —
+   * it relies on the Host/Origin loopback gate — but the token is now part of
+   * the rendered state.
    */
   uiState(): Promise<UiState>;
   /**
-   * The pool's UI row. No credit read of its own: credits belong to accounts,
-   * and each member's row already shows them — a pool balance would have to
-   * pick one member's number and present it as the pool's, which is a lie.
+   * The pool's UI row: its membership, who answers next, and what the router
+   * has seen of each member's real traffic.
+   *
+   * No credit figure of its own: credits belong to accounts, and each member
+   * row shows its own — a pool balance would have to pick one member's number
+   * and present it as the pool's, which is a lie. What the pool row adds is
+   * the thing no account card can show: the routing state.
    */
   private uiPoolOf;
+  /** One pool member row, assembled from the runtime, its health, and its account card. */
+  private uiPoolMemberOf;
+  /**
+   * Send one real chat turn through one pool member, for the page's test button.
+   *
+   * Routed through the account's **own** shim, not the pool: the claim being
+   * tested is "this account can answer", which means the same gates, the same
+   * credential resolution and the same upstream call an agent pointed at that
+   * account would get. The pool is deliberately untouched — a manual test must
+   * not move the head, or checking a spare account would silently redirect
+   * live traffic onto it.
+   */
+  probePoolMember(request: UiProbeRequest): Promise<UiProbeResult>;
+  /** One endpoint's recent turns, newest first, as the page shows them. */
+  private uiRequestsOf;
   /** One endpoint's UI row, including a live credit read. */
   private uiEndpointOf;
   /** Stop serving and destroy open connections. */
@@ -362,81 +739,6 @@ declare class WorkBuddyBridge {
  */
 declare function coalesceReasoning(result: WorkBuddyChatResult): WorkBuddyChatResult;
 //#endregion
-//#region src/standalone/pool.d.ts
-/**
- * The store surface the pool needs from each member. Structural, so tests
- * can stand in stubs; the real bridge passes each account runtime's pieces.
- */
-interface WorkBuddyPoolMember {
-  /** Resolves this member's credential, refreshing it when due. */
-  store: Pick<WorkBuddyCredentialStore, 'resolve'>;
-  /** Sends this member's chat turn upstream. */
-  client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
-}
-/**
- * Upstream failure classes where a different account could plausibly
- * succeed, and are therefore worth failing over on:
- *
- * - `hard_credit` — this account's quota is gone; another account's is not
- * - `soft_rate` — this account is throttled; another is not
- * - `session_dead` — this credential cannot be renewed; another may be fine
- * - `server` — a 5xx may be account-scoped (per-account channel state), and
- *   retrying the identical request on another account is what the upstream's
- *   own 「请重新发送」 advice asks for
- *
- * Everything else stays on the failing member: a `client` (400) failure is a
- * property of the *request*, so every account would answer it identically,
- * and a transport error is a property of the *network*, which is shared.
- */
-declare const POOL_FAILOVER_KINDS: ReadonlySet<UpstreamErrorKind>;
-/** Why a pool member could not be attempted, surfaced for diagnosis. */
-interface WorkBuddyPoolAttempt {
-  /** Position in the member list, 0-based. */
-  index: number;
-  /** What this member's attempt produced, or why it was skipped. */
-  outcome: {
-    state: 'ok';
-  } | {
-    state: 'credential-error';
-    message: string;
-  } | {
-    state: 'upstream-error';
-    status: number;
-    kind: UpstreamErrorKind;
-    message: string;
-  };
-}
-/**
- * One pool endpoint's request router.
- *
- * Implements the two pieces the shim consumes — `store.resolve()` and
- * `client.chatStream()` — over the member list. `resolve()` exists only as
- * the shim's signed-in existence check: it answers with the head member's
- * credential when any member has one, so a pool where every account is
- * signed out still produces the shim's 401 rather than a confused 500. The
- * real per-attempt credential resolution happens inside {@link chatStream}.
- */
-declare class WorkBuddyFailoverPool {
-  private readonly members;
-  /** Where the next request starts; advances past failed members. */
-  private head;
-  constructor(members: readonly WorkBuddyPoolMember[]);
-  /** How many accounts the pool can draw from. */
-  get size(): number;
-  /** The shim's signed-in existence check: any member's credential will do. */
-  resolve(): Promise<WorkBuddyCredential>;
-  /**
-   * Send one chat turn through the pool.
-   *
-   * The `credential` argument is the shim's resolved head credential and is
-   * deliberately ignored: each attempt resolves its own member's credential,
-   * because the whole point is that the answering account is chosen by the
-   * failure pattern, not by whoever happened to be head when the request
-   * arrived. Returns the first success; otherwise the last failure seen.
-   */
-  chatStream(_credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal, onAttempt?: (attempt: WorkBuddyPoolAttempt) => void): Promise<WorkBuddyChatResult>;
-}
-//#endregion
 //#region src/standalone/wsl.d.ts
 /**
  * Are we running *inside* WSL, rather than on the Windows host?
@@ -484,4 +786,4 @@ interface WslForwarderOptions {
  */
 declare function createWslForwarder(options: WslForwarderOptions): WslForwarder;
 //#endregion
-export { BRIDGE_DESCRIPTOR_FILENAME, type BridgeDescriptor, type BridgeEndpoint, type BridgeOptions, POOL_FAILOVER_KINDS, type UiCreditAccount, type UiCredits, type UiEndpoint, type UiModel, type UiState, WorkBuddyBridge, WorkBuddyFailoverPool, type WorkBuddyPoolAttempt, type WorkBuddyPoolMember, type WorkBuddyUiOptions, type WorkBuddyUiServer, type WslForwarder, type WslForwarderOptions, bridgeDescriptorCandidates, bridgeDescriptorPath, coalesceReasoning, createWorkBuddyUiServer, createWslForwarder, isRunningInWsl, main, readBridgeDescriptor, redactForBrowser, removeBridgeDescriptor, writeBridgeDescriptor, wslHostAddresses };
+export { BRIDGE_DESCRIPTOR_FILENAME, type BridgeDescriptor, type BridgeEndpoint, type BridgeOptions, CHAT_PROBE_TIMEOUT_MS, type ChatProbeOptions, type ChatProbeResult, POOL_FAILOVER_KINDS, REQUEST_LOG_LIMIT, REQUEST_ROWS_PER_CARD, type UiCreditAccount, type UiCredits, type UiEndpoint, type UiModel, type UiPool, type UiPoolMember, type UiProbeRequest, type UiProbeResult, UiRequestError, type UiRequestRow, type UiState, WorkBuddyBridge, WorkBuddyFailoverPool, type WorkBuddyPoolAttempt, type WorkBuddyPoolMember, type WorkBuddyPoolMemberHealth, type WorkBuddyRequestAttempt, WorkBuddyRequestLog, type WorkBuddyRequestRecord, type WorkBuddyUiOptions, type WorkBuddyUiServer, type WslForwarder, type WslForwarderOptions, attemptRecord, bridgeDescriptorCandidates, bridgeDescriptorPath, coalesceReasoning, createWorkBuddyUiServer, createWslForwarder, isRunningInWsl, main, modelOfBody, probeChatTurn, readBridgeDescriptor, redactForBrowser, removeBridgeDescriptor, writeBridgeDescriptor, wslHostAddresses };

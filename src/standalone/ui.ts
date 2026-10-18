@@ -34,6 +34,7 @@ import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { hostIsLoopback, originIsLoopback } from '../core/loopback.ts'
 import type { ShimLogger } from '../core/shim.ts'
+import type { WorkBuddyRequestRecord } from './request-log.ts'
 
 /** One credit package, as the UI shows it. */
 export interface UiCreditAccount {
@@ -83,6 +84,8 @@ export interface UiPoolMember {
   accountIndex: number
   /** The account's nickname, or a positional label while none is known. */
   label: string
+  /** The account uid (email or user id), when known. */
+  uid?: string
   signedIn: boolean
   /** The account's own endpoint, so a row can be matched to its card. */
   baseUrl: string
@@ -117,12 +120,30 @@ export interface UiPool {
   members: readonly UiPoolMember[]
 }
 
-/** One served endpoint, as the UI shows it. Never carries the bearer token. */
+/**
+ * One recent turn, as a card shows it.
+ *
+ * The record's internal `id` and `endpoint` key are dropped: the card *is* the
+ * endpoint, and the id exists to keep two identical-looking turns apart in the
+ * log, not to be rendered.
+ */
+export type UiRequestRow = Omit<WorkBuddyRequestRecord, 'id' | 'endpoint'>
+
+/** One served endpoint, as the UI shows it. */
 export interface UiEndpoint {
   provider: string
   displayName: string
   /** The OpenAI-compatible base URL an agent would use. */
   baseUrl: string
+  /**
+   * The WSL-facing base URL, when `--wsl` re-exposes this endpoint on the
+   * WSL virtual switch. Absent when the bridge runs without `--wsl`.
+   */
+  wslBaseUrl?: string
+  /** The bearer token for this endpoint — shown so the user can copy it. */
+  token?: string
+  /** The account uid (email or user id), when known. */
+  uid?: string
   signedIn: boolean
   nickname?: string
   domain?: string
@@ -139,6 +160,8 @@ export interface UiEndpoint {
   models: readonly UiModel[]
   /** Present only on a failover pool: its members and who answers next. */
   pool?: UiPool
+  /** The most recent turns this endpoint served, newest first. Metadata only. */
+  requests: readonly UiRequestRow[]
 }
 
 /** The whole document `/api/state` returns. */
@@ -462,10 +485,38 @@ const PAGE = `<!doctype html>
   }
   button:hover { border-color: var(--accent); }
   main { padding: 24px; display: flex; flex-direction: column; gap: 20px; max-width: 1100px; }
+  .account-toggle-bar { display: flex; justify-content: center; padding: 4px 0; }
+  .account-toggle { font: inherit; font-size: 12px; color: var(--muted); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 16px; cursor: pointer;
+  }
+  .account-toggle:hover { border-color: var(--accent); color: var(--fg); }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-  .card-head { padding: 16px 20px; border-bottom: 1px solid var(--line); }
-  .card-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .connection { display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 20px 14px; }
+  .connection label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 260px; }
+  .connection .conn-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .connection input {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; width: 100%; box-sizing: border-box;
+  }
+  .connection input:focus { outline: none; border-color: var(--accent); }
+  /* The head carries the title and the tab strip; the hairline under the strip
+     is the border, so the two rows read as one unit rather than two blocks. */
+  .card-head { padding: 16px 20px 0; border-bottom: 1px solid var(--line); }
+  .card-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding-bottom: 12px; }
   .card-title h2 { font-size: 14px; font-weight: 500; margin: 0; }
+  .tabs { display: flex; gap: 20px; }
+  .tab {
+    font: inherit; font-size: 12px; color: var(--muted); background: none;
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 7px 0 9px; margin-bottom: -1px; cursor: pointer;
+  }
+  .tab:hover { color: var(--fg); border-bottom-color: var(--line); }
+  .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  .tab .count { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .panel.hidden { display: none; }
+  .meta { padding: 12px 20px 0; color: var(--dim); font-size: 12px; }
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 20px 0; }
   .pill {
     font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
@@ -494,13 +545,48 @@ const PAGE = `<!doctype html>
   .pill.warn { color: var(--warn); border-color: var(--warn); }
   .members td { vertical-align: top; }
   .members tr.head td { background: var(--panel-2); }
-  .who { display: flex; flex-direction: column; gap: 1px; }
+  /* One line per snippet: an upstream refusal can be a paragraph of repeated
+     HTML text, and four wrapped lines in a status cell make the table
+     unscannable. The untruncated string stays in the tooltip. */
+  .members .sub { max-width: 34ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* A column of pills, left-aligned: without this the flex column stretches
+     every pill to the column's width and the whole row reads as a bar chart. */
+  .who { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
   .who .name { font-size: 13px; }
-  .sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dim); }
+  .sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dim);
+         max-width: 30ch; overflow-wrap: anywhere; }
   .result { font-size: 12px; }
   .result.ok { color: var(--ok); }
   .result.bad { color: var(--bad); }
-  .result .detail { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; word-break: break-word; }
+  .result .detail { color: var(--muted); font-size: 11px; display: block; margin-top: 2px;
+                    max-width: 40ch; overflow-wrap: anywhere; }
+  .model-pick {
+    font: inherit; font-size: 12px; color: var(--fg); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; max-width: 22ch;
+  }
+  /* Fixed layout so the columns line up down the table instead of being sized
+     by whichever model name or error text happens to be longest. Widths are in
+     px and total well under the card, so the leftover goes to the flexible
+     columns rather than overflowing. */
+  .requests { table-layout: fixed; }
+  .requests td { vertical-align: middle; padding-top: 6px; padding-bottom: 6px; }
+  .requests tbody tr:hover td { background: var(--panel-2); }
+  .requests .col-time { width: 100px; }
+  .requests .col-model { width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .requests .col-result { width: 160px; }
+  .requests .col-took { width: 84px; }
+  .requests .pill { margin-right: 6px; }
+  .code { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  .chip {
+    display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap;
+  }
+  .chip.ok { color: var(--ok); border-color: var(--ok); }
+  .chip.bad { color: var(--bad); border-color: var(--bad); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .chip .code { color: inherit; opacity: .7; margin-left: 4px; }
+  .arrow { color: var(--dim); margin: 0 6px; }
   footer { padding: 0 24px 32px; }
 </style>
 </head>
@@ -513,8 +599,7 @@ const PAGE = `<!doctype html>
   <button id="refresh">Refresh</button>
 </header>
 <main id="app"></main>
-<footer><p class="dim">No bearer token is ever sent to this page. A test sends one real chat turn
-through that account's own endpoint — it spends a few credits and does not move the pool's head.</p></footer>
+<footer><p class="dim">A test sends one real chat turn through that account's own endpoint — it spends a few credits and does not move the pool's head.</p></footer>
 <script>
 var UI_NONCE = "__UI_NONCE__";
 function esc(v) {
@@ -530,10 +615,45 @@ function fmtTime(ms) {
   var d = new Date(ms);
   return d.toLocaleString();
 }
+function fmtClock(ms) {
+  if (typeof ms !== 'number' || ms <= 0) return '';
+  /* 24-hour and zero-padded: a log column should be a constant width and
+     scannable down the seconds, which "8:06:46 AM" is not. */
+  return new Date(ms).toLocaleTimeString(undefined, { hour12: false });
+}
+function fmtLatency(ms) {
+  if (typeof ms !== 'number' || ms < 0) return '';
+  /* Sub-second turns are the common case here, and "0.1s" hides whether that
+     was 60 ms or 140 ms. */
+  return ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(2) + ' s';
+}
+/* Upstream refusals are sometimes a whole HTML page (an openresty 401). The
+   row is for reading, so markup and runs of whitespace go and the words stay;
+   the untruncated original is still in the tooltip. */
+function plain(text) {
+  return String(text === undefined || text === null ? '' : text)
+    .replace(/<[^>]*>/g, ' ')
+    /* A diagnostic string is often cut mid-tag before it gets here, so the
+       unterminated tail needs removing too — otherwise "<p" survives as text. */
+    .replace(/<[^>]*$/, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim();
+}
+/* A diagnostic notice, readable: plain text, a bounded prefix, raw in the title. */
+function noticeOf(text, bad) {
+  return '<div class="notice' + (bad ? ' bad' : '') + '" title="' + esc(text) + '">'
+    + esc(clip(plain(text), 240)) + '</div>';
+}
+/* Upstream refusals can be a wall of HTML; the row shows a readable prefix and
+   keeps the whole thing in the title attribute. */
+function clip(text, max) {
+  var s = String(text === undefined || text === null ? '' : text);
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
 function creditsBlock(ep) {
   var html = '';
   if (ep.creditsError) {
-    return '<div class="notice bad">Could not read credits: ' + esc(ep.creditsError) + '</div>';
+    return noticeOf('Could not read credits: ' + ep.creditsError, true);
   }
   if (!ep.credits) return '';
   var c = ep.credits;
@@ -602,16 +722,20 @@ function memberLabel(pool, index) {
 }
 function creditsCell(m) {
   if (m.credits) return m.credits.unlimited ? 'Unlimited' : fmtNum(m.credits.total);
-  if (m.creditsError) return '<span class="no">error</span>';
+  if (m.creditsError) {
+    return '<span class="no" title="' + esc(m.creditsError) + '">error</span>';
+  }
   return '<span class="no">—</span>';
 }
 function attemptCell(m) {
-  if (m.lastOutcome === undefined) return '<span class="no">no traffic yet</span>';
+  if (m.lastOutcome === undefined) return '<span class="no">no routed traffic yet</span>';
   var when = m.lastAttemptAtMs ? fmtTime(m.lastAttemptAtMs) : '';
   var pill = m.lastOutcome === 'ok'
     ? '<span class="pill ok">ok</span>'
     : '<span class="pill bad">' + esc(m.lastOutcome === 'credential-error' ? 'credential' : 'upstream') + '</span>';
-  var detail = m.lastOutcomeDetail ? '<span class="sub">' + esc(m.lastOutcomeDetail) + '</span>' : '';
+  var detail = m.lastOutcomeDetail
+    ? '<span class="sub" title="' + esc(m.lastOutcomeDetail) + '">' + esc(clip(plain(m.lastOutcomeDetail), 90)) + '</span>'
+    : '';
   return '<div class="who">' + pill + '<span class="sub">' + esc(when) + '</span>' + detail + '</div>';
 }
 function resultCell(provider, index) {
@@ -622,7 +746,28 @@ function resultCell(provider, index) {
   var head = t.ok
     ? 'pass · ' + (typeof t.latencyMs === 'number' ? (t.latencyMs / 1000).toFixed(1) + 's' : '')
     : 'fail';
-  return '<span class="result ' + cls + '">' + head + '<span class="detail">' + esc(t.detail || '') + '</span></span>';
+  return '<span class="result ' + cls + '">' + head
+    + '<span class="detail" title="' + esc((t.model ? t.model + ' · ' : '') + (t.detail || '')) + '">'
+    + esc(clip(plain(t.detail), 140)) + '</span></span>';
+}
+/*
+ * Which model a test asks for. Kept outside the DOM for the same reason as the
+ * results: the 5s re-render rebuilds the select, and losing the choice between
+ * polls would make "test bob on this model" impossible to hold still.
+ * An empty value means "whatever this account lists first", which is the only
+ * default that cannot be wrong for an account whose roster differs.
+ */
+var chosenModels = {};
+function modelPicker(ep) {
+  if (!ep.models || !ep.models.length) return '';
+  var chosen = chosenModels[ep.provider] || '';
+  var html = '<select class="model-pick" data-model-provider="' + esc(ep.provider) + '">'
+    + '<option value="">default model</option>';
+  for (var i = 0; i < ep.models.length; i++) {
+    var id = ep.models[i].id;
+    html += '<option value="' + esc(id) + '"' + (id === chosen ? ' selected' : '') + '>' + esc(id) + '</option>';
+  }
+  return html + '</select>';
 }
 function poolBlock(ep) {
   var p = ep.pool;
@@ -630,8 +775,13 @@ function poolBlock(ep) {
   var html = '<div class="notice">One endpoint over ' + p.members.length + ' accounts. The next request is answered by '
     + '<strong>' + esc(memberLabel(p, p.headIndex)) + '</strong>. A test runs against that account only — '
     + 'it does not move the head.</div>';
+  /* The test controls live here rather than in the card head: they act on the
+     member table below them, and a header control that does nothing on the
+     Models tab would be a dead button. */
+  html += '<div class="toolbar">' + modelPicker(ep)
+    + '<button class="test-all" data-test-all="' + esc(ep.provider) + '">Test all</button></div>';
   html += '<table class="members"><thead><tr><th>Account</th><th>State</th>'
-        + '<th class="num">Credits</th><th>Last attempt</th><th>Test</th></tr></thead><tbody>';
+        + '<th class="num">Credits</th><th>Last routed turn</th><th>Test</th></tr></thead><tbody>';
   for (var i = 0; i < p.members.length; i++) {
     var m = p.members[i];
     var t = testOf(ep.provider, m.index);
@@ -649,6 +799,7 @@ function poolBlock(ep) {
     state += '<span class="sub">' + fmtNum(m.successes) + ' ok / ' + fmtNum(m.failures) + ' failed</span></div>';
     html += '<tr' + (m.head ? ' class="head"' : '') + '>'
           + '<td><div class="who"><span class="name">' + esc(m.label) + '</span>'
+          + (m.uid ? '<span class="sub">' + esc(m.uid) + '</span>' : '')
           + '<span class="sub">' + esc(m.baseUrl) + '</span></div></td>'
           + '<td>' + state + '</td>'
           + '<td class="num">' + creditsCell(m) + '</td>'
@@ -659,29 +810,130 @@ function poolBlock(ep) {
   }
   return html + '</tbody></table>';
 }
-function renderCard(ep) {
-  var html = '<section class="card"><div class="card-head"><div class="card-title">';
-  html += '<h2>' + esc(ep.displayName) + '</h2>';
-  html += '<span class="pill ' + (ep.signedIn ? 'ok' : 'bad') + '">' + (ep.signedIn ? 'signed in' : 'signed out') + '</span>';
-  if (ep.nickname) html += '<span class="pill">' + esc(ep.nickname) + '</span>';
-  if (ep.domain) html += '<span class="pill">' + esc(ep.domain) + '</span>';
-  html += '<span class="spacer"></span>';
-  if (ep.pool) {
-    html += '<button class="test-all" data-test-all="' + esc(ep.provider) + '">Test all</button> ';
+/* One member's attempt, as a chip. The class carries the verdict so the chain
+   reads at a glance: green answered, red refused, amber could not sign in. */
+function attemptChip(at) {
+  var ok = at.outcome === 'ok';
+  var label = ok ? 'ok' : (at.outcome === 'credential-error' ? 'no credential' : at.outcome);
+  var cls = ok ? 'ok' : (at.outcome === 'credential-error' ? 'warn' : 'bad');
+  var code = !ok && at.status ? '<span class="code">' + esc(String(at.status)) + '</span>' : '';
+  return '<span class="chip ' + cls + '">' + esc(at.account) + ' ' + esc(label) + code + '</span>';
+}
+function attemptsCell(row) {
+  var list = row.attempts || [];
+  if (!list.length) return '<span class="no">—</span>';
+  var parts = [];
+  for (var i = 0; i < list.length; i++) parts.push(attemptChip(list[i]));
+  return parts.join('<span class="arrow">\u2192</span>');
+}
+function requestsTable(ep) {
+  var rows = ep.requests || [];
+  if (!rows.length) {
+    return '<div class="notice">No requests yet. This log is metadata only — model, account, '
+      + 'outcome, timing — and lives in memory.</div>';
   }
-  html += '<span class="url">' + esc(ep.baseUrl) + '</span>';
-  html += '</div>';
+  /* A pool row answers a different question than an account row, so the table
+     has one extra column for it: what the router tried, in order. The account
+     is not a column anywhere — the card's own title already names it. */
+  var pooled = ep.pool !== undefined;
+  var html = '<table class="requests"><thead><tr>'
+    + '<th class="col-time">Time</th>'
+    + '<th class="col-model">Model</th>'
+    + (pooled ? '<th class="col-tried">Tried</th>' : '')
+    + '<th class="col-result">Result</th>'
+    + '<th class="col-took num">Took</th>'
+    + '</tr></thead><tbody>';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var ok = r.outcome === 'ok';
+    var result = '<span class="pill ' + (ok ? 'ok' : 'bad') + '">' + esc(ok ? 'ok' : r.outcome) + '</span>'
+      + (ok ? '' : '<span class="code">' + esc(String(r.status)) + '</span>');
+    html += '<tr>'
+      + '<td class="col-time mono">' + esc(fmtClock(r.atMs)) + '</td>'
+      + '<td class="col-model mono" title="' + esc(r.model) + '">' + esc(r.model) + '</td>'
+      + (pooled ? '<td class="col-tried">' + attemptsCell(r) + '</td>' : '')
+      + '<td class="col-result">' + result + '</td>'
+      + '<td class="col-took num mono">' + esc(fmtLatency(r.latencyMs)) + '</td>'
+      + '</tr>';
+  }
+  return html + '</tbody></table>';
+}
+/*
+ * Three sections per endpoint, one visible at a time: Account (who is signed
+ * in, what is left, and for a pool who answers next), Models, and Logs.
+ *
+ * The choice is kept outside the DOM for the same reason as the test results:
+ * the 5s poll rebuilds the card, and a tab that jumped back to Account on
+ * every refresh would be unusable.
+ */
+var activeTabs = {};
+var showAccounts = false;
+function tabOf(provider) { return activeTabs[provider] || 'account'; }
+function tabStrip(ep) {
+  var active = tabOf(ep.provider);
+  var tabs = [
+    { id: 'account', label: 'Account' },
+    { id: 'models', label: 'Models', count: (ep.models || []).length },
+    { id: 'logs', label: 'Logs', count: (ep.requests || []).length }
+  ];
+  var html = '<div class="tabs" role="tablist">';
+  for (var i = 0; i < tabs.length; i++) {
+    var tab = tabs[i];
+    html += '<button class="tab" role="tab" data-tab="' + tab.id + '"'
+      + ' aria-selected="' + (tab.id === active ? 'true' : 'false') + '">'
+      + esc(tab.label)
+      + (tab.count === undefined ? '' : ' <span class="count">' + fmtNum(tab.count) + '</span>')
+      + '</button>';
+  }
+  return html + '</div>';
+}
+function panel(name, active, inner) {
+  return '<div class="panel' + (name === active ? '' : ' hidden') + '"'
+    + ' data-panel="' + name + '" role="tabpanel">' + inner + '</div>';
+}
+function accountPanel(ep) {
+  var html = '';
   var meta = [];
   if (ep.catalogSource) meta.push('catalog: ' + ep.catalogSource);
   if (ep.catalogFetchedAtMs) meta.push('fetched ' + fmtTime(ep.catalogFetchedAtMs));
   if (ep.source) meta.push('credential: ' + ep.source);
   if (ep.expiresAtMs) meta.push('expires ' + fmtTime(ep.expiresAtMs));
-  if (meta.length) html += '<div class="dim" style="margin-top:6px">' + esc(meta.join('  ·  ')) + '</div>';
-  html += '</div>';
-  if (ep.error) html += '<div class="notice bad">' + esc(ep.error) + '</div>';
+  if (meta.length) html += '<div class="meta">' + esc(meta.join('  ·  ')) + '</div>';
+  if (ep.error) html += noticeOf(ep.error, true);
   html += creditsBlock(ep);
   html += poolBlock(ep);
-  html += modelsTable(ep.models || []);
+  return html;
+}
+function renderCard(ep) {
+  var active = tabOf(ep.provider);
+  var html = '<section class="card" data-provider="' + esc(ep.provider) + '">';
+  html += '<div class="card-head"><div class="card-title">';
+  html += '<h2>' + esc(ep.displayName) + '</h2>';
+  html += '<span class="pill ' + (ep.signedIn ? 'ok' : 'bad') + '">' + (ep.signedIn ? 'signed in' : 'signed out') + '</span>';
+  if (ep.nickname) html += '<span class="pill">' + esc(ep.nickname) + '</span>';
+  if (ep.domain) html += '<span class="pill">' + esc(ep.domain) + '</span>';
+  html += '</div>';
+  if (ep.baseUrl || ep.token) {
+    html += '<div class="connection">';
+    if (ep.baseUrl) {
+      html += '<label><span class="conn-label">Base URL</span>'
+        + '<input readonly value="' + esc(ep.baseUrl) + '" onclick="this.select()"></label>';
+    }
+    if (ep.wslBaseUrl) {
+      html += '<label><span class="conn-label">WSL URL</span>'
+        + '<input readonly value="' + esc(ep.wslBaseUrl) + '" onclick="this.select()"></label>';
+    }
+    if (ep.token) {
+      html += '<label><span class="conn-label">API Key</span>'
+        + '<input readonly value="' + esc(ep.token) + '" onclick="this.select()"></label>';
+    }
+    html += '</div>';
+  }
+  html += tabStrip(ep);
+  html += '</div>';
+  html += panel('account', active, accountPanel(ep));
+  html += panel('models', active, modelsTable(ep.models || []));
+  html += panel('logs', active, requestsTable(ep));
   html += '</section>';
   return html;
 }
@@ -694,8 +946,26 @@ function render(state) {
     app.innerHTML = '<div class="notice">No endpoints are being served.</div>';
     return;
   }
+  var pools = [];
+  var accounts = [];
+  for (var i = 0; i < state.endpoints.length; i++) {
+    var ep = state.endpoints[i];
+    if (ep.pool !== undefined) pools.push(ep);
+    else accounts.push(ep);
+  }
   var html = '';
-  for (var i = 0; i < state.endpoints.length; i++) html += renderCard(state.endpoints[i]);
+  for (var p = 0; p < pools.length; p++) html += renderCard(pools[p]);
+  /* A global toggle is cleaner than one per card: the question is "do I want
+     to see the individual accounts at all?" not "do I want to see alice?". */
+  if (accounts.length) {
+    html += '<div class="account-toggle-bar">'
+      + '<button class="account-toggle" data-toggle-accounts="1">'
+      + (showAccounts ? 'Hide accounts' : 'Show ' + accounts.length + ' account' + (accounts.length > 1 ? 's' : ''))
+      + '</button></div>';
+    if (showAccounts) {
+      for (var a = 0; a < accounts.length; a++) html += renderCard(accounts[a]);
+    }
+  }
   app.innerHTML = html;
 }
 
@@ -708,12 +978,15 @@ function render(state) {
  */
 function runTest(provider, index, done) {
   var key = testKey(provider, index);
+  var body = { provider: provider, index: index };
+  var chosen = chosenModels[provider];
+  if (chosen) body.model = chosen;
   tests[key] = { running: true };
   if (lastState) render(lastState);
   fetch('/api/pool/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Bridge-Ui': UI_NONCE },
-    body: JSON.stringify({ provider: provider, index: index })
+    body: JSON.stringify(body)
   })
     .then(function (r) {
       return r.json().then(function (body) { return { status: r.status, body: body }; });
@@ -751,13 +1024,44 @@ function runAll(provider) {
   step();
 }
 document.getElementById('app').addEventListener('click', function (event) {
-  var target = event.target;
-  if (!target || target.tagName !== 'BUTTON') return;
-  if (target.dataset.testProvider !== undefined) {
-    runTest(target.dataset.testProvider, Number(target.dataset.testIndex));
+  /* "closest", not event.target directly: a tab's label carries a count span,
+     and clicking the number must switch the tab like clicking the word. */
+  var button = event.target && event.target.closest ? event.target.closest('button') : null;
+  if (!button) return;
+  /* Global show/hide for individual account cards. Pools are always visible. */
+  if (button.dataset.toggleAccounts !== undefined) {
+    showAccounts = !showAccounts;
+    if (lastState) render(lastState);
     return;
   }
-  if (target.dataset.testAll !== undefined) runAll(target.dataset.testAll);
+  /* A tab switch is a class toggle rather than a re-render: it keeps the
+     scroll position, and it cannot race the 5s poll into showing the wrong
+     panel. The choice is recorded so the next poll rebuilds it open. */
+  if (button.dataset.tab !== undefined) {
+    var card = button.closest('.card');
+    if (!card) return;
+    activeTabs[card.getAttribute('data-provider') || ''] = button.dataset.tab;
+    var tabs = card.querySelectorAll('.tab');
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].setAttribute('aria-selected', tabs[i] === button ? 'true' : 'false');
+    }
+    var panels = card.querySelectorAll('.panel');
+    for (var p = 0; p < panels.length; p++) {
+      panels[p].classList.toggle('hidden', panels[p].getAttribute('data-panel') !== button.dataset.tab);
+    }
+    return;
+  }
+  if (button.dataset.testProvider !== undefined) {
+    runTest(button.dataset.testProvider, Number(button.dataset.testIndex));
+    return;
+  }
+  if (button.dataset.testAll !== undefined) runAll(button.dataset.testAll);
+});
+document.getElementById('app').addEventListener('change', function (event) {
+  var target = event.target;
+  if (target && target.dataset && target.dataset.modelProvider !== undefined) {
+    chosenModels[target.dataset.modelProvider] = target.value;
+  }
 });
 var timer = null;
 function load() {

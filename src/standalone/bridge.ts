@@ -32,6 +32,13 @@ import { captureChannelFailure } from './failure-capture.ts'
 import { coalesceReasoning } from './coalesce.ts'
 import { probeChatTurn, type ChatProbeOptions, type ChatProbeResult } from './account-probe.ts'
 import { WorkBuddyFailoverPool, type WorkBuddyPoolAttempt, type WorkBuddyPoolMemberHealth } from './pool.ts'
+import {
+  attemptRecord,
+  modelOfBody,
+  WorkBuddyRequestLog,
+  type WorkBuddyRequestAttempt,
+  type WorkBuddyRequestRecord,
+} from './request-log.ts'
 import { join } from 'node:path'
 import {
   UiRequestError,
@@ -41,6 +48,7 @@ import {
   type UiPoolMember,
   type UiProbeRequest,
   type UiProbeResult,
+  type UiRequestRow,
   type UiState,
 } from './ui.ts'
 
@@ -110,6 +118,8 @@ interface VariantRuntime {
   accountTotal: number
   /** The current credential's nickname, maintained by the sweep for labelling. */
   nickname: string | undefined
+  /** The current credential's uid (email or user id), maintained by the sweep. */
+  uid: string | undefined
 }
 
 /** Options for {@link WorkBuddyBridge}. */
@@ -259,7 +269,7 @@ function uiCreditsOf(credits: WorkBuddyCredits): UiCredits {
  */
 function endpointDisplayName(runtime: VariantRuntime): string {
   if (runtime.accountTotal <= 1) return runtime.variant.displayName
-  const who = runtime.nickname ?? `account ${runtime.accountIndex}`
+  const who = runtime.nickname ?? runtime.uid ?? `account ${runtime.accountIndex}`
   return `${runtime.variant.displayName} · ${who}`
 }
 
@@ -285,6 +295,8 @@ export class WorkBuddyBridge {
   private readonly options: BridgeOptions
   /** Probe keys (`provider#index`) currently in flight, so a double click cannot double-spend. */
   private readonly probes = new Set<string>()
+  /** The turns agents have sent, for the UI. Metadata only, in memory, bounded. */
+  private readonly requests = new WorkBuddyRequestLog()
   private timer: NodeJS.Timeout | undefined
   private stopped = false
   private startedAtMs = 0
@@ -301,6 +313,33 @@ export class WorkBuddyBridge {
   private finishChat(result: WorkBuddyChatResult): WorkBuddyChatResult {
     if (this.options.coalesceReasoning === false) return result
     return coalesceReasoning(result)
+  }
+
+  /**
+   * Record one turn against the endpoint the agent addressed.
+   *
+   * Metadata only: the body is parsed for its model name and then dropped, so
+   * the log never holds a prompt. Called on the request path, therefore free
+   * of I/O — and it cannot fail a turn, because the log is worth less than the
+   * request it describes.
+   */
+  private noteTurn(input: {
+    endpoint: string
+    account?: string
+    bodyJson: string
+    result: WorkBuddyChatResult
+    latencyMs: number
+    attempts?: readonly WorkBuddyRequestAttempt[]
+  }): void {
+    this.requests.record({
+      endpoint: input.endpoint,
+      ...input.account === undefined ? {} : { account: input.account },
+      model: modelOfBody(input.bodyJson),
+      status: input.result.ok ? 200 : input.result.status,
+      outcome: input.result.ok ? 'ok' : input.result.kind,
+      latencyMs: input.latencyMs,
+      ...input.attempts === undefined || input.attempts.length === 0 ? {} : { attempts: input.attempts },
+    })
   }
 
   /**
@@ -394,9 +433,32 @@ export class WorkBuddyBridge {
       })))
       // The shim's option types name the concrete store class, but it only
       // ever calls `store.resolve()`; the pool implements that contract.
+      //
+      // Its client is a wrapper rather than the router itself for one reason:
+      // the router already reports every member it tried through `onAttempt`,
+      // and a pool's log entry is only useful with that chain attached.
       const shim = createWorkBuddyShim({
         store: pool as unknown as WorkBuddyCredentialStore,
-        client: pool,
+        client: {
+          chatStream: async (credential, bodyJson, signal) => {
+            const startedAtMs = Date.now()
+            const attempts: WorkBuddyRequestAttempt[] = []
+            const result = await pool.chatStream(credential, bodyJson, signal, attempt => {
+              attempts.push(attemptRecord(attempt, index => {
+                const member = members[index]
+                return member?.nickname ?? `account ${member?.accountIndex ?? index + 1}`
+              }))
+            })
+            this.noteTurn({
+              endpoint: `${variant.id}-pool`,
+              bodyJson,
+              result,
+              latencyMs: Date.now() - startedAtMs,
+              attempts,
+            })
+            return result
+          },
+        },
         catalog,
         ...logger === undefined ? {} : { logger },
       })
@@ -440,12 +502,10 @@ export class WorkBuddyBridge {
   }
 
   /**
-   * Build the web UI's state document.
-   *
-   * Deliberately carries **no bearer token**. The UI page cannot be
-   * authenticated — a browser navigation cannot attach an `Authorization`
-   * header — so it must not be able to read the secret that authenticates the
-   * shim. Only the model list, credit balance, and sign-in identity cross here.
+   * Build the web UI's state document. Carries the bearer token so the user
+   * can copy it from the pool card. The page itself is still unauthenticated —
+   * it relies on the Host/Origin loopback gate — but the token is now part of
+   * the rendered state.
    */
   async uiState(): Promise<UiState> {
     const endpoints: UiEndpoint[] = []
@@ -478,8 +538,10 @@ export class WorkBuddyBridge {
       provider: `${pool.variant.id}-pool`,
       displayName: `${pool.variant.displayName} · pool (failover)`,
       baseUrl: `${pool.shim.baseUrl()}/v1`,
+      token: pool.shim.token(),
       signedIn: pool.members.some(runtime => runtime.identity !== undefined),
       models: pool.catalog.current().map(uiModelOf),
+      requests: this.uiRequestsOf(`${pool.variant.id}-pool`),
       pool: {
         headIndex,
         members: pool.members.map((runtime, index) => this.uiPoolMemberOf(runtime, index, headIndex, health[index], rows.get(runtime))),
@@ -501,7 +563,8 @@ export class WorkBuddyBridge {
     return {
       index,
       accountIndex: runtime.accountIndex,
-      label: runtime.nickname ?? `account ${runtime.accountIndex}`,
+      label: runtime.nickname ?? runtime.uid ?? `account ${runtime.accountIndex}`,
+      ...runtime.uid === undefined ? {} : { uid: runtime.uid },
       signedIn: runtime.identity !== undefined,
       baseUrl: `${runtime.shim.baseUrl()}/v1`,
       head: index === headIndex,
@@ -546,7 +609,9 @@ export class WorkBuddyBridge {
     this.probes.add(key)
     try {
       const result = await (this.options.probe ?? probeChatTurn)({
-        baseUrl: member.shim.baseUrl(),
+        // The published shape, `/v1` included: the probe is an agent, so it
+        // must be given the URL an agent would be given.
+        baseUrl: `${member.shim.baseUrl()}/v1`,
         token: member.shim.token(),
         model,
       })
@@ -562,15 +627,31 @@ export class WorkBuddyBridge {
     }
   }
 
+  /** One endpoint's recent turns, newest first, as the page shows them. */
+  private uiRequestsOf(endpoint: string): readonly UiRequestRow[] {
+    return this.requests.recent(endpoint).map((record: WorkBuddyRequestRecord) => ({
+      atMs: record.atMs,
+      ...record.account === undefined ? {} : { account: record.account },
+      model: record.model,
+      status: record.status,
+      outcome: record.outcome,
+      latencyMs: record.latencyMs,
+      ...record.attempts === undefined ? {} : { attempts: record.attempts },
+    }))
+  }
+
   /** One endpoint's UI row, including a live credit read. */
   private async uiEndpointOf(runtime: VariantRuntime): Promise<UiEndpoint> {
     const base: UiEndpoint = {
       provider: runtime.variant.id,
       displayName: endpointDisplayName(runtime),
       baseUrl: `${runtime.shim.baseUrl()}/v1`,
+      token: runtime.shim.token(),
       signedIn: runtime.identity !== undefined,
       models: runtime.catalog.current().map(uiModelOf),
+      requests: this.uiRequestsOf(`${runtime.variant.id}#${runtime.accountIndex}`),
       ...runtime.error === undefined ? {} : { error: runtime.error },
+      ...runtime.uid === undefined ? {} : { uid: runtime.uid },
     }
     // `current()`, not `resolve()`: looking at the page must not trigger a
     // token refresh as a side effect of being observed. If the credential is
@@ -673,11 +754,27 @@ export class WorkBuddyBridge {
     // The shim gets a thin wrapper rather than the raw client, so a channel
     // refusal records the exchange that caused it. Catalog, billing and token
     // refresh keep using the real client, so capture cannot affect them.
+    //
+    // `runtime` is assigned below, before this endpoint can serve anything —
+    // the shim only answers once it is listening, and the assignment happens
+    // first. It is read here rather than captured because the account's
+    // nickname is discovered by the sweep after the shim is built.
+    let runtime: VariantRuntime | undefined
     const shim = createWorkBuddyShim({
       store,
       client: {
         chatStream: async (credential, bodyJson, signal) => {
+          const startedAtMs = Date.now()
           const result = await client.chatStream(credential, bodyJson, signal)
+          if (runtime !== undefined) {
+            this.noteTurn({
+              endpoint: `${variant.id}#${runtime.accountIndex}`,
+              account: runtime.nickname ?? `account ${runtime.accountIndex}`,
+              bodyJson,
+              result,
+              latencyMs: Date.now() - startedAtMs,
+            })
+          }
           void captureChannelFailure(variant.id, bodyJson, result)
           return this.finishChat(result)
         },
@@ -691,7 +788,7 @@ export class WorkBuddyBridge {
       logger?.error(`workbuddy-bridge: ${variant.displayName} loopback endpoint failed to start`, error)
       return undefined
     }
-    return {
+    runtime = {
       variant,
       store,
       client,
@@ -706,7 +803,9 @@ export class WorkBuddyBridge {
       accountIndex: account.accountIndex,
       accountTotal: account.accountTotal,
       nickname: undefined,
+      uid: undefined,
     }
+    return runtime
   }
 
   private async syncAll(): Promise<void> {
@@ -766,6 +865,7 @@ export class WorkBuddyBridge {
         runtime.identity = undefined
       }
       runtime.nickname = undefined
+      runtime.uid = undefined
       runtime.catalog.set(fallbackFor(runtime.variant))
       runtime.source = 'fallback'
       runtime.error = undefined
@@ -788,6 +888,7 @@ export class WorkBuddyBridge {
     // because the saved one is what this account was actually shown.
     runtime.identity = identity
     runtime.nickname = credential.nickname
+    runtime.uid = credential.uid
     const saved = runtime.savedCatalogs.get(identity)
     if (saved !== undefined) {
       runtime.catalog.set([...saved.models])

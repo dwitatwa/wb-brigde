@@ -20,9 +20,14 @@
 /** How long one probe turn may take before it is abandoned. */
 export const CHAT_PROBE_TIMEOUT_MS = 60_000
 
-/** What to probe: one endpoint origin plus the credential it accepts. */
+/** What to probe: one endpoint plus the credential it accepts. */
 export interface ChatProbeOptions {
-  /** The shim origin, without a `/v1` suffix. */
+  /**
+   * The OpenAI-compatible base URL, **including** the `/v1` suffix — the same
+   * string the descriptor publishes and an agent is configured with. Getting
+   * this wrong is not a subtle failure: the shim answers `/chat/completions`
+   * with its own 404, which reads exactly like an upstream refusal.
+   */
   baseUrl: string
   /** That shim's bearer token — the one an agent would be configured with. */
   token: string

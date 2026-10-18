@@ -35,6 +35,15 @@ export {
   type WorkBuddyPoolMemberHealth,
 } from './pool.ts'
 export {
+  attemptRecord,
+  modelOfBody,
+  REQUEST_LOG_LIMIT,
+  REQUEST_ROWS_PER_CARD,
+  WorkBuddyRequestLog,
+  type WorkBuddyRequestAttempt,
+  type WorkBuddyRequestRecord,
+} from './request-log.ts'
+export {
   createWslForwarder,
   isRunningInWsl,
   wslHostAddresses,
@@ -53,6 +62,7 @@ export {
   type UiPoolMember,
   type UiProbeRequest,
   type UiProbeResult,
+  type UiRequestRow,
   type UiState,
   type WorkBuddyUiOptions,
   type WorkBuddyUiServer,

@@ -18,6 +18,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { resolveBridgeHome } from '../core/bridge-home.ts'
 import { isChannelValidationBlock, type WorkBuddyChatResult } from '../core/upstream.ts'
+import { modelOfBody } from './request-log.ts'
 
 /** Filename under the bridge home. */
 export const CHANNEL_FAILURE_FILENAME = 'last-channel-failure.json'
@@ -54,21 +55,6 @@ export function channelFailurePath(): string {
   return join(resolveBridgeHome(), CHANNEL_FAILURE_FILENAME)
 }
 
-/** Pull `model` out of a body without assuming it parses. */
-function modelOf(bodyJson: string): string {
-  try {
-    const parsed: unknown = JSON.parse(bodyJson)
-    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-      const model = (parsed as Record<string, unknown>)['model']
-      if (typeof model === 'string') return model
-    }
-  } catch {
-    // A body that does not parse is itself worth capturing; the field is
-    // cosmetic, so a miss is not a failure.
-  }
-  return '(unknown)'
-}
-
 /**
  * Persist a channel-validation failure, if that is what happened.
  *
@@ -86,7 +72,7 @@ export async function captureChannelFailure(
   const record: ChannelFailureRecord = {
     at: new Date().toISOString(),
     provider,
-    model: modelOf(bodyJson),
+    model: modelOfBody(bodyJson),
     upstreamStatus: result.status,
     upstreamBody: result.message.slice(0, UPSTREAM_BODY_LIMIT),
     requestBody: bodyJson.slice(0, REQUEST_BODY_LIMIT),
