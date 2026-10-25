@@ -30,9 +30,9 @@ export const BRIDGE_DESCRIPTOR_FILENAME = '.workbuddy-bridge-endpoint.json'
 /** Current descriptor format; readers reject others. */
 const DESCRIPTOR_VERSION = 1
 
-/** One served variant, as an external client needs to address it. */
+/** One served provider or pool, as an external client needs to address it. */
 export interface BridgeEndpoint {
-  /** Provider id, `workbuddy` or `workbuddy-ai`. */
+  /** Built-in product, pool, or configured custom provider id. */
   provider: string
   /** Human-readable group name, e.g. `WorkBuddy AI`. */
   displayName: string
@@ -52,7 +52,7 @@ export interface BridgeEndpoint {
   token: string
   /** How many models `/v1/models` currently lists. */
   modelCount: number
-  /** Whether a credential is currently usable for this variant. */
+  /** Whether credentials are usable (or not required); not a connectivity check. */
   signedIn: boolean
   /**
    * Why no credential is usable, when the reason is *diagnosable* rather than

@@ -50,6 +50,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { hostnameOfHost, hostIsLoopback, originIsLoopback } from '../core/loopback.ts'
+import { listenOnPreferredPort } from '../core/listen.ts'
 import type { ShimLogger } from '../core/shim.ts'
 
 /**
@@ -115,6 +116,8 @@ export interface WslForwarderOptions {
   target: string
   /** Which host address to bind; one of {@link wslHostAddresses}. */
   host: string
+  /** Preferred port on that address; a taken port falls back to an ephemeral one. */
+  port?: number
   logger?: ShimLogger
 }
 
@@ -156,14 +159,11 @@ export function createWslForwarder(options: WslForwarderOptions): WslForwarder {
   const server: Server = createServer((req, res) => {
     void handle(req, res)
   })
-  const ready = new Promise<void>((resolve, reject) => {
-    server.once('listening', () => { resolve() })
-    server.once('error', reject)
-  })
   // Bound to the WSL switch address only. Binding 0.0.0.0 would also expose
   // the bridge on the real LAN interface, which is a much larger surface than
-  // the problem requires.
-  server.listen(0, host)
+  // the problem requires. A remembered port keeps the address an agent inside
+  // WSL was configured with; a taken one falls back.
+  const ready = listenOnPreferredPort(server, options.port, host)
 
   const url = (): string => {
     const address = server.address()

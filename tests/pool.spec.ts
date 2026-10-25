@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { WorkBuddyCredential } from '../src/core/auth.ts'
 import type { WorkBuddyChatResult } from '../src/core/upstream.ts'
 import { AI_VARIANT } from '../src/core/variants.ts'
-import type { ChatProbeOptions, ChatProbeResult } from '../src/standalone/account-probe.ts'
+import type { ChatProbeResult, MemberProbeOptions } from '../src/standalone/account-probe.ts'
 import { WorkBuddyBridge } from '../src/standalone/bridge.ts'
 import { POOL_FAILOVER_KINDS, WorkBuddyFailoverPool, type WorkBuddyPoolMember } from '../src/standalone/pool.ts'
 
@@ -214,43 +214,46 @@ async function authFile(nickname: string, uid: string): Promise<string> {
 }
 
 describe('the pool endpoint in the bridge', () => {
-  it('appears only for products with two or more accounts, and shuts down with the bridge', async () => {
+  it('is the product\'s only endpoint, however many accounts serve it, and shuts down with the bridge', async () => {
     home = await mkdtemp(join(tmpdir(), 'wb-pool-'))
     process.env['WORKBUDDY_BRIDGE_HOME'] = home
     const first = await authFile('alice', 'uid-a')
     const second = await authFile('bob', 'uid-b')
     const bridge = new WorkBuddyBridge({
       variants: [AI_VARIANT],
-      pool: 'failover',
       authFiles: new Map([['workbuddy-ai', [first, second]]]),
     })
     try {
       const descriptor = await bridge.start()
-      const pools = descriptor.endpoints.filter(endpoint => endpoint.provider === 'workbuddy-ai-pool')
-      expect(pools.length).toBe(1)
-      expect(pools[0]!.displayName).toContain('pool')
-      // The pool is a distinct endpoint: distinct port, distinct token, so
-      // an agent pointed at it is configured against the pool, not against
-      // whichever account happens to be head right now.
-      const accounts = descriptor.endpoints.filter(endpoint => endpoint.provider === 'workbuddy-ai')
-      expect(pools[0]!.baseUrl).not.toBe(accounts[0]!.baseUrl)
-      expect(pools[0]!.token).not.toBe(accounts[0]!.token)
+      // One endpoint for the product: the pool. There are no per-account
+      // endpoints to configure alongside it, and the pool's port and token
+      // are its own.
+      expect(descriptor.endpoints.length).toBe(1)
+      expect(descriptor.endpoints[0]!.provider).toBe('workbuddy-ai-pool')
+      expect(descriptor.endpoints[0]!.displayName).toContain('pool')
+      expect(descriptor.endpoints[0]!.signedIn).toBe(true)
     } finally {
       await bridge.close()
+      const ports = bridge.endpoints()
+      expect(ports).toEqual([])
     }
   })
 
-  it('does not create a pool endpoint when the option is absent', async () => {
+  it('serves one account through the pool, without per-account endpoints', async () => {
     home = await mkdtemp(join(tmpdir(), 'wb-pool-'))
     process.env['WORKBUDDY_BRIDGE_HOME'] = home
-    const first = await authFile('alice', 'uid-a')
-    const second = await authFile('bob', 'uid-b')
+    const only = await authFile('alice', 'uid-a')
     const bridge = new WorkBuddyBridge({
-      authFiles: new Map([['workbuddy-ai', [first, second]]]),
+      variants: [AI_VARIANT],
+      authFiles: new Map([['workbuddy-ai', [only]]]),
     })
     try {
       const descriptor = await bridge.start()
-      expect(descriptor.endpoints.filter(endpoint => endpoint.provider.endsWith('-pool')).length).toBe(0)
+      expect(descriptor.endpoints.map(endpoint => endpoint.provider)).toEqual(['workbuddy-ai-pool'])
+      const state = await bridge.uiState()
+      const pool = state.endpoints[0]!
+      expect(pool.pool!.members.map(member => member.label)).toEqual(['alice'])
+      expect(pool.pool!.headIndex).toBe(0)
     } finally {
       await bridge.close()
     }
@@ -267,7 +270,7 @@ describe('the pool endpoint in the bridge', () => {
 describe('the pool\'s UI surface', () => {
   /** A bridge over two AI accounts with a failover pool. */
   async function twoAccountBridge(
-    probe: (options: ChatProbeOptions) => Promise<ChatProbeResult>,
+    probe: (options: MemberProbeOptions) => Promise<ChatProbeResult>,
   ): Promise<WorkBuddyBridge> {
     home = await mkdtemp(join(tmpdir(), 'wb-pool-ui-'))
     process.env['WORKBUDDY_BRIDGE_HOME'] = home
@@ -275,7 +278,6 @@ describe('the pool\'s UI surface', () => {
     const second = await authFile('bob', 'uid-b')
     return new WorkBuddyBridge({
       variants: [AI_VARIANT],
-      pool: 'failover',
       authFiles: new Map([['workbuddy-ai', [first, second]]]),
       probe,
     })
@@ -300,35 +302,31 @@ describe('the pool\'s UI surface', () => {
       expect(pool?.pool?.members.map(member => [member.successes, member.failures])).toEqual([[0, 0], [0, 0]])
       expect(pool?.pool?.members[0]?.lastOutcome).toBeUndefined()
       expect(pool?.pool?.members[0]?.lastAttemptAtMs).toBeUndefined()
-      // A member's own endpoint is its own port, not the pool's.
-      expect(pool?.pool?.members[0]?.baseUrl).not.toBe(pool?.baseUrl)
+      // Members have no own endpoints since per-account endpoints were removed.
+      expect(pool?.pool?.members.every(member => member.baseUrl === undefined)).toBe(true)
       // The log is wired per endpoint and starts empty — it is filled by real
       // turns, which this test deliberately does not send.
       expect(pool?.requests).toEqual([])
-      expect(state.endpoints.find(endpoint => endpoint.provider === 'workbuddy-ai')?.requests).toEqual([])
     } finally {
       await bridge.close()
     }
   })
 
-  it('tests a member through that account\'s own endpoint and token, leaving the head alone', async () => {
-    const seen: ChatProbeOptions[] = []
+  it('tests a member through the account\'s own upstream path, leaving the head alone', async () => {
+    const seen: MemberProbeOptions[] = []
     const bridge = await twoAccountBridge(async options => {
       seen.push(options)
       return { ok: true, status: 200, latencyMs: 9, detail: 'HTTP 200' }
     })
     try {
       await bridge.start()
-      const endpoints = bridge.endpoints()
-      const accounts = endpoints.filter(endpoint => endpoint.provider === 'workbuddy-ai')
       const result = await bridge.probePoolMember({ provider: 'workbuddy-ai-pool', index: 1 })
 
       expect(result).toMatchObject({ provider: 'workbuddy-ai-pool', index: 1, label: 'bob', ok: true })
-      // The point of the test: bob's shim and bob's token, so a pass means bob
-      // can answer — not that the pool found somebody who could. The URL is
-      // the published one, `/v1` included, because that is what an agent gets.
-      expect(seen[0]?.baseUrl).toBe(accounts[1]?.baseUrl)
-      expect(seen[0]?.token).toBe(accounts[1]?.token)
+      // The probe runs in process through bob's own chat path (no HTTP
+      // endpoint involved) and carries the model it asked about.
+      expect(seen[0]?.sendTurn).toBeDefined()
+      expect(seen[0]?.baseUrl).toBeUndefined()
       expect(seen[0]?.model).toBe(result.model)
 
       // A manual test is an observation, not a routing decision.

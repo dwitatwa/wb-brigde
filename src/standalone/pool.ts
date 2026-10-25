@@ -42,7 +42,8 @@ export interface WorkBuddyPoolMember {
  *
  * - `hard_credit` — this account's quota is gone; another account's is not
  * - `soft_rate` — this account is throttled; another is not
- * - `session_dead` — this credential cannot be renewed; another may be fine
+ * - `session_dead` — this credential cannot be renewed, or the gateway has
+ *   restricted the account itself; another may be fine
  * - `server` — a 5xx may be account-scoped (per-account channel state), and
  *   retrying the identical request on another account is what the upstream's
  *   own 「请重新发送」 advice asks for

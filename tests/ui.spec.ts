@@ -1,4 +1,5 @@
 import { request } from 'node:http'
+import { runInNewContext } from 'node:vm'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createWorkBuddyUiServer,
@@ -152,6 +153,73 @@ async function nonceOf(server: WorkBuddyUiServer): Promise<string> {
   if (match?.[1] === undefined) throw new Error('the page carries no nonce')
   return match[1]
 }
+
+describe('generic provider rendering', () => {
+  async function renderGeneric(signedIn: boolean, provider = 'custom', customOnly = false) {
+    const server = await start()
+    const page = await call(server, '/')
+    const script = /<script>([\s\S]*?)<\/script>/u.exec(page.text)![1]!
+    const nodes = new Map<string, { innerHTML: string, textContent: string, addEventListener: () => void }>()
+    const node = (id: string) => {
+      if (!nodes.has(id)) nodes.set(id, { innerHTML: '', textContent: '', addEventListener: () => {} })
+      return nodes.get(id)!
+    }
+    const context = {
+      document: { getElementById: node, addEventListener: () => {}, activeElement: null, querySelector: () => null },
+      fetch: () => new Promise(() => {}),
+      setInterval: () => 0,
+    }
+    node('pool-note').textContent = /<footer[^>]*>([\s\S]*?)<\/footer>/u.exec(page.text)?.[1]?.replace(/<[^>]*>/gu, '') ?? ''
+    runInNewContext(script, context)
+    const fixture = state()
+    const generic = {
+      provider, kind: 'openai-compatible', displayName: 'Custom <safe>',
+      baseUrl: 'http://127.0.0.1:55000/v1', token: 'local-only-token', signedIn,
+      error: signedIn ? undefined : 'Missing API key: CUSTOM_KEY',
+      models: [{ id: 'shared-model', name: 'shared-model' }],
+      requests: [{ atMs: 1, model: 'shared-model', status: 429, outcome: 'client', latencyMs: 5 }],
+    }
+    Object.assign(context, { input: { ...fixture, endpoints: customOnly ? [generic] : [generic, ...fixture.endpoints] } })
+    runInNewContext('render(input)', context)
+    // Include the served footer text; a conditional footer updates this node.
+    return node('app').innerHTML + node('pool-note').textContent
+  }
+
+  it('shows the credit-spending note only when a pool is present', async () => {
+    const custom = await renderGeneric(true, 'custom', true)
+    expect(custom).not.toContain('spends a few credits')
+    expect(custom).not.toContain("pool's head")
+    const mixed = await renderGeneric(true)
+    expect(mixed).toContain('spends a few credits')
+    expect(mixed).toContain("pool's head")
+  })
+
+  it('keeps the Account tab label stable for a provider named constructor', async () => {
+    const html = await renderGeneric(true, 'constructor')
+    expect(html).toContain('data-tab="account" aria-selected="true">Account')
+    expect(html).toContain('class="panel" data-panel="account"')
+  })
+
+  it.each([true, false])('shows a pool-style card for the custom provider, configured=%s', async signedIn => {
+    const html = await renderGeneric(signedIn)
+    const card = html.slice(html.indexOf('<section class="card" data-provider="custom"'), html.indexOf('</section>', html.indexOf('data-provider="custom"')))
+    expect(card).toContain('Custom &lt;safe&gt;')
+    expect(card).toContain('Account')
+    expect(card).toContain(signedIn ? 'signed in' : 'signed out')
+    expect(card).toContain('shared-model')
+    expect(card).toContain('429')
+    expect(card).toContain('local-only-token')
+    // The copied token is labelled explicitly: the management editor also has
+    // an "API key" field for the upstream credential, and the two must not be
+    // mistakable for each other.
+    expect(card).toContain('Local bridge API key')
+    expect(card).not.toMatch(/conn-label">API Key</u)
+    expect(card).not.toMatch(/credits remaining|expires /u)
+    expect(html).toContain('data-provider="workbuddy-ai-pool"')
+    expect(html).not.toContain('data-provider="workbuddy-ai"')
+    expect(html).not.toContain('Show 1 account')
+  })
+})
 
 describe('the UI server', () => {
   it('serves the page with a nonce, and never a bearer token', async () => {

@@ -44,14 +44,17 @@ Every module below was moved verbatim. The only edits were import paths.
 | `core/probe*.ts`, `core/visibility-store.ts` | reasoning detection, hidden models |
 | `core/client-identity.ts`, `core/app-version.ts` | the CLI/desktop identity headers |
 
-The shim's behaviour is **unchanged**, including the parts that make it awkward
+The shim's **defaults** are unchanged, including the parts that make it awkward
 to configure:
 
 - it binds an **ephemeral port** (`listen(0, '127.0.0.1')`), and
 - its bearer token is a **per-process in-memory secret** (`randomBytes(32)`).
 
-The standalone frontend does not alter either. It *publishes* them instead —
-see below.
+Both are now optional **preferences**. The standalone runner passes the port and
+token an endpoint used on its previous start, so a client configured once keeps
+working across restarts. Given neither option the shim still binds an ephemeral
+port and mints a random secret, so every existing caller is unaffected. The
+standalone frontend also *publishes* the values — see below.
 
 ### What changed
 
@@ -93,7 +96,7 @@ Everything else in `core/upstream.ts` — the forced streaming, the string
 ```sh
 pnpm install
 pnpm build
-node lib/cli.js serve
+node lib/run.js serve
 ```
 
 On startup it prints each endpoint and a copy-paste block:
@@ -117,6 +120,185 @@ workbuddy-bridge env
 # export OPENAI_BASE_URL=http://127.0.0.1:39271/v1
 # export OPENAI_API_KEY=4Kt…
 ```
+
+### Adding your own provider (custom OpenAI-compatible providers)
+
+You can add any OpenAI-compatible provider — a commercial API, a local
+gateway, anything that speaks Chat Completions — directly from the web UI.
+Custom providers do not need WorkBuddy or a desktop sign-in, and they do not
+change the DSH plugin.
+
+**Add a provider in the existing UI.** Start the bridge with the web UI
+(`workbuddy-bridge ui`, or `pnpm start`) and open the page. Use the add-provider
+form on the page and fill in:
+
+- **Display name** — any label you like; a slug `id` is generated from it.
+- **Base URL** — the **full API prefix**: the bridge removes trailing slashes
+  and appends **`/chat/completions`** itself, with no automatic `/v1`. Thus
+  `https://api.example.com/v1` sends chat to
+  `https://api.example.com/v1/chat/completions`, while
+  `https://gateway.example.com/team/api` sends chat to
+  `https://gateway.example.com/team/api/chat/completions`. Use HTTPS except for
+  a local loopback server, where HTTP is allowed. No credentials, query strings,
+  or fragments.
+- **Model IDs** — typed by hand. There is no automatic model discovery, so copy
+  the exact model IDs your provider documents. Wrong or misspelled IDs are
+  accepted but every chat turn naming them is refused.
+- **Auth mode** — `api-key` (enter the provider's upstream API key once) or
+  `none` (for upstreams that need no key, such as a local gateway).
+
+**Save, edit, remove.** Saving takes effect immediately — the provider joins the
+failover pool and starts serving on the pool's loopback endpoint, without
+restarting the bridge. Editing swaps the provider's configuration in place (only
+the model list or key changes; the pool's URL and token stay the same); removing
+drops the provider from the pool. The page reloads its list after each change,
+and your saved providers come back automatically on the next `ui` start — no
+flags, no config files, no environment variables needed. If a saved provider
+collides with an id already configured via `--config`, the bridge refuses with
+an explicit error rather than silently overwriting either one.
+
+**Every provider is served through one failover pool.** The same arrangement the
+WorkBuddy account pool uses, applied to providers: one endpoint, `custom-pool`,
+fronts every custom provider — one provider is enough, and there are no
+per-provider endpoints beside it.
+
+- Point an agent at **one** URL. The bridge prints the pool as the suggested
+  base URL.
+- Each request goes to the provider that offers its model. When several do, the
+  current **head** provider answers.
+- A provider that refuses in a way another provider could survive is skipped
+  and the next one is tried: `401`/`403` (key refused), `402` (payment
+  required), `404` (no such route at that gateway), `429` (rate limited), and
+  any `5xx`. A `400` is a property of the request, so it stops the chain
+  instead of retrying everywhere. With a single provider the pool still serves,
+  it just has nowhere else to fail over to.
+- A success keeps that provider as the head; a failover moves the head to the
+  provider that answered. A healthy provider is not rotated for its own sake.
+- The pool exists from the first provider on and closes only when the last one
+  is removed. Its URL and local token stay the same across edits, because the
+  listener is not rebuilt per change.
+- The pool's **Providers** tab shows one row per provider: whether it is ready,
+  whether it answers next, its last routed turn, its own failures, and
+  **Test**. A test sends a real turn at that provider's own upstream and does
+  not move the head. **Edit** and **Remove** work from that row too. A provider
+  that came from `--config` is read-only there.
+- The pool's **Tried** column in the log names the provider every turn was
+  served by — including a single-attempt success.
+
+The pool is not a second configuration: it reads the same saved providers, and
+it is the only endpoint they are served on.
+
+**How the key and token work.** Your provider's upstream API key is stored
+privately in a credential file under your bridge home
+(`~/.workbuddy-bridge/managed-providers/`). The file is **not encrypted** — it
+is protected only by your user account's file permissions, the same trust level
+as the desktop app's own files. The key never appears in the descriptor, the
+UI, or error messages: the **Local bridge API key shown on the pool card is the
+local bridge token** for clients to connect with, not any upstream key. The
+pool endpoint has its own local token; each provider's own key is used only for
+the upstream call routed to it, and one provider's key is never sent to another.
+
+**The local server has no authentication by design** (any local process or
+browser page can reach the UI port within the loopback/Origin gates), and
+management actions are additionally gated by a per-process nonce. Configured
+does **not** mean tested: the bridge never probes your provider's connectivity,
+so a wrong URL or key is only discovered when an agent actually calls.
+
+Custom providers appear on one pool card. Its **Providers**, **Models**, and
+**Logs** tabs show the membership table described above, the union of the
+configured model IDs, and request metadata. The pool card comes first, and each
+log row carries the provider that served it in the **Tried** column. Pool
+request logs map HTTP errors to the pool's coarse outcome classes; they do not
+use WorkBuddy error classifiers. They store no prompts or responses.
+
+Supported: JSON and SSE OpenAI-compatible **Chat Completions**. Request bodies
+and successful streams pass through without WorkBuddy transforms or reasoning
+coalescing. The model list comes only from your configuration. There is no
+Responses API, automatic model discovery, WorkBuddy billing, or DSH integration.
+Custom-provider failover is the provider pool described above; it is separate
+from the WorkBuddy account pool. `--wsl`, `--redact-token`, and
+`--no-descriptor` also apply to the pool endpoint.
+
+### Configuring providers with a file (compatibility)
+
+The classic way to configure custom providers is a JSON file passed with
+`--config`. This remains fully supported and is useful for scripted or
+headless setups where the web UI is not used.
+
+Create `providers.json`:
+
+```json
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "my-api",
+      "displayName": "My API",
+      "baseUrl": "https://api.example.com/v1",
+      "apiKeyEnv": "MY_API_KEY",
+      "models": ["my-model"]
+    }
+  ]
+}
+```
+
+`version: 1` is mandatory. Provider IDs must be unique lowercase slugs; built-in
+IDs and the aliases `cn`, `ai`, and `both` are reserved. Model IDs can be the same
+across different providers. Unknown fields are rejected. `displayName` and
+`apiKeyEnv` are optional; omit `apiKeyEnv` only if the upstream needs no key.
+The upstream key is read from the **environment** (per request), so set it in
+the shell that starts the bridge — these values are placeholders, not real keys:
+
+```sh
+export MY_API_KEY='replace-with-your-provider-key'
+workbuddy-bridge serve --config ./providers.json
+workbuddy-bridge ui --config ./providers.json
+```
+
+PowerShell:
+
+```powershell
+$env:MY_API_KEY = 'replace-with-your-provider-key'
+workbuddy-bridge ui --config .\providers.json
+```
+
+The bridge reads a config file **only** when you pass `--config <path>`. It does
+not search for config files. It validates the complete file before it starts
+listeners. Without `--provider`, configured providers follow the existing
+WorkBuddy endpoints. To run only the custom provider, use:
+
+```sh
+workbuddy-bridge serve --config ./providers.json --provider my-api
+workbuddy-bridge ui --config ./providers.json --provider my-api
+# Mix providers; comma-separated and repeated selections are supported:
+workbuddy-bridge serve --config ./providers.json --provider ai,my-api --provider cn
+```
+
+An explicit selection serves only the requested providers. Duplicate selections
+are removed. `cn` and `ai` select their WorkBuddy products. `both` selects only
+the two built-in products, not custom providers. Unknown IDs are errors, including
+for `workbuddy-bridge test --provider <id>`. `models`, `status`, and `env` continue
+to read the running bridge descriptor; they do not load a config file.
+
+**Exact URL rule:** `baseUrl` is the full upstream API prefix. The bridge removes
+trailing slashes and appends **`/chat/completions`**, with no automatic `/v1`.
+Thus `https://api.example.com/v1` sends chat to
+`https://api.example.com/v1/chat/completions`, while
+`https://gateway.example.com/team/api` sends chat to
+`https://gateway.example.com/team/api/chat/completions`.
+Use HTTPS except for a local loopback server, where HTTP is allowed. URLs must
+not contain credentials, query strings, or fragments.
+
+File-configured providers are **read-only as served**: they are never rewritten
+by the UI manager. A saved (UI-managed) provider whose id collides with an
+externally configured one is an explicit, safe error — neither one silently
+overwrites the other. File-config providers differ from managed ones in how
+they get their key: an env variable name (`apiKeyEnv`) resolved per request,
+versus a key stored in the managed credential file. Restart the bridge after
+config or shell environment changes for file-config providers; managed
+providers need no restart. Each endpoint keeps its local port and token across
+restarts, so an agent configured once keeps working; the descriptor is still
+the place to read them if you need to check.
 
 ### Seeing the model list
 
@@ -173,7 +355,7 @@ Windows the search reads the uninstall registry, so it will report this if
 |---|---|
 | `serve` | start the bridge (default) |
 | `ui` | start the bridge **plus** the local web UI |
-| `start` | `ui` with `--pool failover --all-accounts` (one command for the usual setup) |
+| `start` | `ui` with `--all-accounts` (one command for the usual setup) |
 | `start:wsl` | `start` plus `--wsl` |
 | `test` | send one real chat turn through the running bridge, over both the loopback and WSL routes |
 | `models [--json]` | list the models the running bridge serves |
@@ -223,7 +405,7 @@ For the usual setup with a failover pool and every discovered account, use the
 convenience command instead of spelling the flags out:
 
 ```sh
-pnpm start              # ui + --pool failover --all-accounts
+pnpm start              # ui + --all-accounts
 pnpm start:wsl          # same, plus --wsl for WSL agents
 ```
 
@@ -251,25 +433,35 @@ The tab counts (`Models 27`, `Logs 3`) are live, the choice is remembered per
 card across the 5-second refresh, and the tab you are on does not reset when a
 turn lands. The expand/collapse choice is also remembered.
 
-The page polls `/api/state` every 5 seconds and has a manual refresh. It is
-read-only apart from the per-account test buttons, and it works with the
-network down: it is a single self-contained response with no CDN, fonts, or
-build step.
+The page polls `/api/state` every 5 seconds and has a manual refresh. Besides
+the per-account test buttons it can add, edit, and remove custom providers (see
+[Adding your own provider](#adding-your-own-provider-custom-openai-compatible-providers));
+everything else is read-only. It works with the network down: it is a single
+self-contained response with no CDN, fonts, or build step.
 
 ### Why the UI is safe
 
 The UI listens on its **own** loopback port — the shim's surface stays exactly
 as upstream defines it. That port cannot require a bearer token, because a
 browser navigating to a URL cannot attach an `Authorization` header. So it
-relies on the same pair of gates the upstream plugin's status route uses:
+relies on a Host/Origin pair of gates plus a nonce:
 
 1. the request must name a loopback `Host` (this is what stops DNS rebinding),
-2. any browser-sent `Origin` must be loopback.
+2. a browser-sent `Origin` must be loopback **or exactly one of the origins the
+   bridge itself published** (the UI's own origin, and the WSL forwarder's URL
+   when started with `--wsl`) — no other origin can load the page through the
+   WSL hop, and the list is host-controlled: a request's own Host or Origin can
+   never add itself to it,
+3. the state-changing routes (per-account tests and provider
+   add/edit/remove) additionally demand the per-process nonce the page carries,
+   repeated in an `X-Bridge-Ui` header; a cross-origin page cannot read it, and
+   a custom header forces a preflight this server does not answer.
 
 The bearer token **is** placed in the page so you can copy it, but the surface
 itself is still gated: a cross-origin request cannot reach it, and the token is
 never sent in error responses. Error text crossing to the browser is redacted
-through the same filter the upstream status route uses.
+through the same filter the upstream status route uses. Provider keys are never
+sent to the page at all — only the boolean `hasApiKey`.
 
 Verify it yourself:
 
@@ -304,8 +496,9 @@ is *each account's own first model*, so an account with a slightly different
 roster is still tested against something it actually serves; picking a model an
 account does not serve is refused with 400 rather than sent upstream.
 
-Because the page cannot be authenticated, the test route is gated on a nonce
-the page carries and repeats in an `X-Bridge-Ui` header. A cross-origin page
+Because the page cannot be authenticated, the test route — like every
+state-changing route, provider management included — is gated on a nonce the
+page carries and repeats in an `X-Bridge-Ui` header. A cross-origin page
 cannot read the nonce, and a custom header forces a preflight this server does
 not answer; the route also requires `application/json`, which a simple form
 POST cannot send. Without both gates, any page open in the same browser could
@@ -359,7 +552,32 @@ code.
 | `--home <dir>` | override the bridge home |
 | `--no-descriptor` | do not write the descriptor file |
 | `--redact-token` | write the descriptor without the bearer token |
+| `--no-stable-endpoints` | choose a fresh port and token on every start, instead of reusing each endpoint's last pair |
 | `--json` | machine-readable output |
+
+### Stable addresses
+
+Each endpoint remembers the loopback port and bearer token it bound, in
+`.workbuddy-bridge-identity.json` under the bridge home (`0600`). The next
+start asks for the same pair, so an agent configured once keeps working across
+restarts — no re-copying, no `401`, no connection refusal.
+
+Both values are **preferences**, never requirements:
+
+- a port another process now holds (or a second bridge) falls back to a free
+  one, and the descriptor records what actually bound;
+- a missing, unreadable, or damaged identity file just means every endpoint
+  starts the way it always did;
+- two endpoints never share a port, because each bind happens in turn and a
+  taken port falls back.
+
+The web UI's port and each WSL forwarder's port are remembered the same way, so
+the page URL and the address an agent inside WSL uses also survive a restart.
+
+`--no-stable-endpoints` restores the historical behaviour of a fresh port and
+token each start. `--no-descriptor` keeps its promise of an in-memory-only
+secret: ports are still reused, but no token is written to or read from the
+identity file.
 
 ### Multiple accounts
 
@@ -375,64 +593,62 @@ workbuddy-bridge serve --wsl --all-accounts
 ```
 
 The sweep collects the live file and every snapshot, keeps the newest copy
-per account, skips files that belong to the other product, and starts one
-endpoint per account — no paths to type. Explicit `--auth-file*` flags win
-for the product they name, so a hand-picked list is never silently widened.
+per account, skips files that belong to the other product, and joins one
+account per file to the product's pool — no paths to type. Explicit
+`--auth-file*` flags win for the product they name, so a hand-picked list is
+never silently widened.
 
 **Explicit listing.** Repeat the auth-file flag once per account, in any
 order:
 
 ```sh
 workbuddy-bridge serve --wsl \
-  --auth-file-ai "C:/…/snaps/workbuddy-alice.info" \
-  --auth-file-ai "C:/…/snaps/workbuddy-bob.info"
+  --auth-file-ai "C:/.../snaps/workbuddy-alice.info" \
+  --auth-file-ai "C:/.../snaps/workbuddy-bob.info"
 ```
 
-Each file becomes its own endpoint — own credential store, own port, own
-bearer token — labelled by the account's nickname in `status`, `models`, and
-the web UI:
+Each file becomes a pool member — own credential store, own plugin-owned
+credential copy — labelled by the account's nickname in the pool card:
 
 ```
-WorkBuddy AI · alice  http://127.0.0.1:51001/v1  27 models
-WorkBuddy AI · bob    http://127.0.0.1:51002/v1  27 models
+WorkBuddy AI · pool (failover)  http://127.0.0.1:51001/v1  27 models
+  alice  · next · 12 ok / 0 failed
+  bob    · next · 3 ok / 2 failed
 ```
 
 Capture each account's auth file by signing into that account in the desktop
-app once and copying `workbuddy-desktop.info` aside. The provider id stays
-`workbuddy-ai` on every endpoint, so tooling that filters by provider keeps
-working; pick the account by its base URL. Notes:
+app once and copying `workbuddy-desktop.info` aside. Notes:
 
-- A single repeated flag behaves exactly as the old single-path flag did —
-  the bare product name, no label.
 - Each account keeps its own plugin-owned credential copy
   (`.workbuddy-auth-N.json`), so their token refreshes never overwrite each
   other. Saved model catalogs are shared per product and keyed by account
   identity, which is how the store already distinguished accounts.
-- The web UI shows each account's credits on its own row.
+- The web UI shows each account's credits on its own row in the pool table.
 
 ### The failover pool
 
-With several accounts served, `--pool failover` adds **one extra endpoint per
-product** that draws on all of them:
+Every product is served through **one pool endpoint per product** that draws
+on all of its accounts — there are no per-account endpoints beside it:
 
 ```sh
-workbuddy-bridge serve --wsl --all-accounts --pool failover
+workbuddy-bridge serve --wsl --all-accounts
 ```
 
 ```
-WorkBuddy AI · alice  http://127.0.0.1:51001/v1  27 models  token: …
-WorkBuddy AI · bob    http://127.0.0.1:51002/v1  27 models  token: …
-WorkBuddy AI · pool (failover)  http://127.0.0.1:51003/v1  27 models  token: …
+WorkBuddy AI · pool (failover)  http://127.0.0.1:51001/v1  27 models  token: ...
 ```
 
 Point an agent at the pool's base URL and its requests stop depending on any
 one account: the pool serves from one account until it fails, then moves to
 the next **when the failure is one another account could survive** — out of
-credits (402), rate-limited (429), a dead session (401), or an upstream 5xx.
+credits (402), rate-limited (429), a dead session (401), a gateway-restricted
+account (403 naming the account, not the request), or an upstream 5xx.
 The head stays with whichever account last succeeded, so a healthy account is
 not sampled by every request. A request-level failure (a 400) is *not* retried
 elsewhere — every account would refuse that body identically, and the error is
-returned as-is so you can see the real cause.
+returned as-is so you can see the real cause. With a single account the pool
+still serves — it just has nowhere else to fail over to, and the URL stays
+valid when you add a second account.
 
 Three things to accept before using it:
 
@@ -441,8 +657,6 @@ Three things to accept before using it:
   — but credit usage is spread across accounts and harder to attribute.
 - **Pool members' usage patterns become correlated** (same machine, rotating
   identities), which is a more visible pattern than separate use.
-- Only products serving **two or more** accounts get a pool endpoint; a
-  one-member pool would just duplicate that account's own endpoint.
 
 The pool rides on the same shim — same gates, same per-process token — with
 its own port and bearer token in the descriptor (`provider:
@@ -644,9 +858,10 @@ wire_api = "chat"
 export WORKBUDDY_BRIDGE_TOKEN="$(workbuddy-bridge env | sed -n 's/.*API_KEY=//p')"
 ```
 
-> Because the port and token are per-process, **re-read them after every
-> restart.** `workbuddy-bridge env` exists so a launcher script can do that
-> automatically.
+> The port and token are **kept across restarts**, so a value copied once stays
+> valid. They are not guaranteed: if another process holds the port, the bridge
+> takes a free one and the descriptor records the change. `workbuddy-bridge env`
+> re-reads the current values, so a launcher script stays correct either way.
 
 ---
 
@@ -779,11 +994,12 @@ leaving you to guess. A persistent `11128` after that means something else:
 - **the request never reached the shim.** The `X-Conversation-*` headers are
   added *by the bridge*, not by the agent, so they cannot be the missing piece
   on their own;
-- **the agent is pointed at a stale endpoint.** The port and the bearer token
-  are per process, so **both change on every restart**. An agent configured once
-  will fail after a restart — a connection refusal for a stale port, or a `401`
-  for a stale token. Re-run `eval "$(workbuddy-bridge env)"` before launching
-  it, or copy the current values from `workbuddy-bridge status`.
+- **the agent is pointed at a stale endpoint.** The port and bearer token are
+  kept across restarts, so this is no longer the usual cause — but it can still
+  happen: another process may have taken the port (the bridge then picks a free
+  one), the bridge home may have moved, or the agent may hold a token from
+  before a `--no-stable-endpoints` run. Compare with `workbuddy-bridge status`,
+  and re-run `eval "$(workbuddy-bridge env)"` before launching the agent.
 
 The `[code …]` suffix exists so a report is diagnosable: `11128` is *also* what
 a rejected `role: "developer"` message returns, and several unrelated failures
@@ -798,7 +1014,7 @@ The shim's own gates are unchanged and all still apply to every request:
 1. the `Host` header must name loopback (this is what stops DNS rebinding),
 2. a browser-sent `Origin` must be loopback,
 3. chat `POST`s must be `application/json`,
-4. the `Authorization` bearer must match the per-process secret.
+4. the `Authorization` bearer must match the endpoint's secret.
 
 **The one deliberate trade-off:** to let an external agent connect at all, the
 runner has to tell it the secret, so it writes the token to a `0600` file. That
@@ -808,6 +1024,12 @@ inherent in publishing an endpoint to a client you did not spawn. Use
 `--no-descriptor` to keep the secret in memory only (you then have to copy the
 token from the console), or `--redact-token` to keep it out of the file while
 still recording the URLs.
+
+Keeping the token across restarts adds nothing to that exposure: the same token
+is already written to the descriptor, at the same mode, in the same directory.
+The identity file is a second `0600` file with the same trust boundary. If you
+want the secret to live only in memory, `--no-descriptor` covers the identity
+file too — it stops token reuse while still keeping ports stable.
 
 The real credential never reaches the agent: the shim resolves it from the
 desktop store itself, and only ever sends it upstream.

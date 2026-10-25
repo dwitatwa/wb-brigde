@@ -32,8 +32,10 @@
 
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { listenOnPreferredPort } from '../core/listen.ts'
 import { hostIsLoopback, originIsLoopback } from '../core/loopback.ts'
 import type { ShimLogger } from '../core/shim.ts'
+import { ProviderManagementError, type ProviderManagement } from './provider-store.ts'
 import type { WorkBuddyRequestRecord } from './request-log.ts'
 
 /** One credit package, as the UI shows it. */
@@ -87,8 +89,12 @@ export interface UiPoolMember {
   /** The account uid (email or user id), when known. */
   uid?: string
   signedIn: boolean
-  /** The account's own endpoint, so a row can be matched to its card. */
-  baseUrl: string
+  /**
+   * The account's own endpoint, so a row can be matched to its card. Absent
+   * since per-account endpoints were removed — a member has no endpoint of
+   * its own to name; the pool card is the only address an agent uses.
+   */
+  baseUrl?: string
   /** Whether this member will answer the next request. */
   head: boolean
   /** Turns this member served successfully since the bridge started. */
@@ -104,6 +110,12 @@ export interface UiPoolMember {
   lastOutcomeDetail?: string
   credits?: UiCredits
   creditsError?: string
+  /**
+   * Whether the page can edit this member, and under which provider id. A
+   * custom-pool member is a provider card of its own, so the pool row can
+   * carry the same Edit/Remove controls that card does.
+   */
+  editId?: string
 }
 
 /**
@@ -118,6 +130,11 @@ export interface UiPool {
   /** Which member answers next, 0-based. */
   headIndex: number
   members: readonly UiPoolMember[]
+  /**
+   * What a member is: an account of one product, or a custom provider.
+   * Absent means accounts, so an older host document renders unchanged.
+   */
+  kind?: 'accounts' | 'providers'
 }
 
 /**
@@ -131,6 +148,8 @@ export type UiRequestRow = Omit<WorkBuddyRequestRecord, 'id' | 'endpoint'>
 
 /** One served endpoint, as the UI shows it. */
 export interface UiEndpoint {
+  /** Absent means a WorkBuddy account or pool, for backward compatibility. */
+  kind?: 'openai-compatible'
   provider: string
   displayName: string
   /** The OpenAI-compatible base URL an agent would use. */
@@ -170,6 +189,14 @@ export interface UiState {
   startedAtMs: number
   nowMs: number
   endpoints: readonly UiEndpoint[]
+  /**
+   * A persistent banner the host sets in its state callback — set by the
+   * standalone runner when a provider change was saved and became active but
+   * its endpoint publication (descriptor write or WSL forwarder binding)
+   * failed, cleared when publication later succeeds. A fixed, safe string the
+   * runner owns; never error text, so no redaction question can arise.
+   */
+  providerWarning?: string
 }
 
 /** What the page asks the bridge to test: one pool member. */
@@ -211,7 +238,24 @@ export class UiRequestError extends Error {
   }
 }
 
-/** A running UI server. */
+/**
+ * The provider-management contract, owned by the store module and re-exported
+ * here so the UI's surface is self-contained for embedders. The store's
+ * `ProviderManagementError` is imported as a value: known manager rejections
+ * are matched by `instanceof` against that one class, never structurally, so
+ * a raw error that merely names itself alike cannot smuggle its message to
+ * the page.
+ */
+export type {
+  ManagedProvider,
+  ManagedProviderSnapshot,
+  ProviderManagement,
+} from './provider-store.ts'
+export { ProviderManagementError } from './provider-store.ts'
+
+/**
+ * A running UI server.
+ */
 export interface WorkBuddyUiServer {
   /** Resolves once the listener is up; rejects if listening failed. */
   ready: Promise<void>
@@ -232,6 +276,30 @@ export interface WorkBuddyUiOptions {
    * is what an embedder that cannot afford upstream calls should pass.
    */
   probe?: (request: UiProbeRequest) => Promise<UiProbeResult>
+  /**
+   * Provider management (add/edit/remove custom OpenAI-compatible providers).
+   *
+   * Absent means the page is read-only: no editor, no management routes — an
+   * embedder that hands out a fixed configuration keeps its read-only UI.
+   */
+  providers?: ProviderManagement
+  /**
+   * Exact extra origins the UI is served from, e.g. the WSL forwarder's URL
+   * when the bridge was started with `--wsl`. Called per request so a
+   * late-bound forwarder port is seen.
+   *
+   * Purely host-controlled: the request's own Host or Origin can never add
+   * itself to this list. A browser Origin that matches an entry exactly is
+   * trusted to *load* the page and poll state; management routes additionally
+   * demand the nonce. A merely-loopback Origin (any local port) is trusted for
+   * page/state as before, but never for management.
+   */
+  allowedUiOrigins?: () => string[]
+  /**
+   * Preferred loopback port, so the page keeps the address the operator has
+   * bookmarked. A taken port falls back to an ephemeral one.
+   */
+  port?: number
   logger?: ShimLogger
 }
 
@@ -282,29 +350,86 @@ function redactState(state: UiState): UiState {
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) })
+  // no-store on every JSON answer, errors included: a cached 403 or a cached
+  // provider list would outlive the state it described, and a shared cache is
+  // not part of this threat model but a browser back/forward cache is.
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+  })
   res.end(payload)
 }
 
-/** The Host/Origin loopback pair, identical to the upstream status route's gate. */
-function loopbackRequest(req: IncomingMessage): boolean {
-  return hostIsLoopback(req.headers.host) && originIsLoopback(req.headers.origin)
+/**
+ * Host gate for every route: the Host header must name the loopback
+ * interface. A DNS-rebinding page carries its own domain in Host, so this is
+ * what defeats rebinding; the WSL forwarder rewrites Host to the loopback
+ * target, so forwarded requests pass here too.
+ */
+function hostGate(req: IncomingMessage): boolean {
+  return hostIsLoopback(req.headers.host)
+}
+
+/**
+ * Origin gate for page/state: absent (non-browser) or loopback passes as
+ * before; otherwise the Origin must exactly match one of the host-configured
+ * UI origins (the WSL forwarder URL). No arbitrary loopback port and no
+ * substring match — a sibling local server's port is not this UI.
+ */
+function pageOriginAllowed(req: IncomingMessage, allowedUiOrigins: (() => string[]) | undefined): boolean {
+  const origin = req.headers.origin
+  if (origin === undefined || origin.trim() === '') return true
+  if (originIsLoopback(origin)) return true
+  const allowed = allowedUiOrigins?.() ?? []
+  return allowed.some(entry => entry.trim() === origin.trim())
+}
+
+/**
+ * Origin gate for management routes: stricter than the page's. A browser
+ * Origin is only trusted when it exactly matches a host-configured UI origin;
+ * "merely loopback" is not enough, because any local page can send loopback
+ * origins and the nonce alone must not become the whole boundary for a route
+ * that stores credentials. An absent Origin (non-browser caller, or a page
+ * whose client sent no Origin) still passes — the nonce carries that request.
+ */
+function managementOriginAllowed(req: IncomingMessage, allowedUiOrigins: (() => string[]) | undefined): boolean {
+  const origin = req.headers.origin
+  if (origin === undefined || origin.trim() === '') return true
+  const allowed = allowedUiOrigins?.() ?? []
+  return allowed.some(entry => entry.trim() === origin.trim()) || entryMatchesSelf(req, origin)
+}
+
+/** The served loopback origin itself is always a trusted management origin. */
+function entryMatchesSelf(req: IncomingMessage, origin: string): boolean {
+  const address = selfAddress(req)
+  return address !== undefined && origin.trim() === `http://127.0.0.1:${address}`
+}
+
+function selfAddress(req: IncomingMessage): number | undefined {
+  const host = req.headers.host
+  if (host === undefined) return undefined
+  const { hostname, port } = new URL(`http://${host.trim()}`)
+  return hostname === '127.0.0.1' && port !== '' ? Number(port) : undefined
 }
 
 /** Largest probe body accepted; the page sends a provider name and an index. */
 const PROBE_BODY_LIMIT = 8 * 1024
 
+/** Largest management body accepted; a provider description with model list. */
+const MANAGEMENT_BODY_LIMIT = 64 * 1024
+
 /** Header the page repeats the nonce in. Custom, so it forces a preflight. */
 const PROBE_HEADER = 'x-bridge-ui'
 
 /** Read a request body with a size cap. */
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage, limit: number): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     const buffer = chunk as Buffer
     size += buffer.length
-    if (size > PROBE_BODY_LIMIT) throw new UiRequestError(413, 'request body too large')
+    if (size > limit) throw new UiRequestError(413, 'request body too large')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')
@@ -338,26 +463,93 @@ function parseProbeRequest(raw: string): UiProbeRequest {
 }
 
 /**
+ * Validate a management save body at the transport boundary.
+ *
+ * Field-level rules (URL shape, model syntax, reserved ids) belong to the
+ * manager — the store owns them and its errors carry precise messages. Here
+ * only the shape the route forwards is checked, and only enough that a
+ * non-object or a wrong-typed revision never reaches the manager. Unknown
+ * keys are passed through: rejecting them here would duplicate the manager's
+ * schema, and the manager already rejects what it does not know.
+ */
+function parseSaveBody(raw: string): Record<string, unknown> {
+  const record = parseManagementBody(raw)
+  const requireNonEmptyString = (key: string): string => {
+    const value = record[key]
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new UiRequestError(400, `${key} must be a non-empty string`)
+    }
+    return value
+  }
+  requireNonEmptyString('displayName')
+  requireNonEmptyString('baseUrl')
+  const models = record['models']
+  if (!Array.isArray(models) || models.some(model => typeof model !== 'string' || model.trim() === '')) {
+    throw new UiRequestError(400, 'models must be an array of non-empty strings')
+  }
+  if (record['authMode'] !== 'api-key' && record['authMode'] !== 'none') {
+    throw new UiRequestError(400, 'authMode must be "api-key" or "none"')
+  }
+  const apiKey = record['apiKey']
+  if (apiKey !== undefined && typeof apiKey !== 'string') {
+    throw new UiRequestError(400, 'apiKey must be a string when present')
+  }
+  return record
+}
+
+/**
+ * Validate a management body at the transport boundary: object with a
+ * non-empty string revision. Field-level rules (URL shape, model syntax,
+ * reserved ids) belong to the manager — the store owns them and its errors
+ * carry precise messages.
+ */
+function parseManagementBody(raw: string): Record<string, unknown> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new UiRequestError(400, 'body must be JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new UiRequestError(400, 'body must be a JSON object')
+  }
+  const record = parsed as Record<string, unknown>
+  if (typeof record['revision'] !== 'string' || record['revision'] === '') {
+    throw new UiRequestError(400, 'revision must be a non-empty string')
+  }
+  return record
+}
+
+function parseRemoveBody(raw: string): { revision: string, id: string } {
+  const record = parseManagementBody(raw)
+  const id = record['id']
+  if (typeof id !== 'string' || id === '') {
+    throw new UiRequestError(400, 'id must be a non-empty string')
+  }
+  return { revision: record['revision'] as string, id }
+}
+
+/**
  * Start the UI server.
  *
  * Returns `ready` rather than awaiting the listen, so a caller can hold the
  * handle before the port is known — the same shape the shim exposes.
  */
 export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyUiServer {
-  const { state, probe, logger } = options
+  const { state, probe, providers, allowedUiOrigins, logger } = options
   // Minted per process, not per page: the page is re-served on every load, and
   // a token that changed under a reload would make an open tab's test buttons
   // fail for no reason the user could see.
   const nonce = randomUUID()
-  const page = PAGE.replace('"__UI_NONCE__"', JSON.stringify(nonce))
+  const page = PAGE
+    .replace('"__UI_NONCE__"', JSON.stringify(nonce))
+    .replace('"__MANAGE__"', JSON.stringify(providers !== undefined))
   const server: Server = createServer((req, res) => {
     void handle(req, res)
   })
-  const ready = new Promise<void>((resolve, reject) => {
-    server.once('listening', () => { resolve() })
-    server.once('error', reject)
-  })
-  server.listen(0, '127.0.0.1')
+  // A remembered port keeps the operator's bookmark working; a taken one
+  // falls back rather than refusing to serve the page.
+  const ready = listenOnPreferredPort(server, options.port, '127.0.0.1')
 
   const url = (): string => {
     const address = server.address()
@@ -367,13 +559,20 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
-      if (!loopbackRequest(req)) {
+      // Host first: a rebinding page names its own domain in Host, and the WSL
+      // forwarder rewrites Host to the loopback target, so forwarded requests
+      // pass this unchanged.
+      if (!hostGate(req)) {
         writeJson(res, 403, { error: 'request-not-trusted' })
         return
       }
       const path = (req.url ?? '/').split('?')[0]
       if (req.method === 'GET') {
         if (path === '/' || path === '/index.html') {
+          if (!pageOriginAllowed(req, allowedUiOrigins)) {
+            writeJson(res, 403, { error: 'request-not-trusted' })
+            return
+          }
           res.writeHead(200, {
             'Content-Type': 'text/html; charset=utf-8',
             'Content-Length': Buffer.byteLength(page),
@@ -383,7 +582,23 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
           return
         }
         if (path === '/api/state') {
+          if (!pageOriginAllowed(req, allowedUiOrigins)) {
+            writeJson(res, 403, { error: 'request-not-trusted' })
+            return
+          }
           writeJson(res, 200, redactState(await state()))
+          return
+        }
+        if (path === '/api/providers') {
+          if (!managementGate(req, nonce)) {
+            writeJson(res, 403, { error: 'request-not-trusted' })
+            return
+          }
+          if (providers === undefined) {
+            writeJson(res, 501, { error: 'provider management is not available' })
+            return
+          }
+          writeJson(res, 200, await providers.list())
           return
         }
         writeJson(res, 404, { error: `no such route: ${req.method} ${path}` })
@@ -392,8 +607,9 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
       if (req.method === 'POST' && path === '/api/pool/test') {
         // The nonce check comes first and answers like the host gate: a
         // request that cannot prove it came from this page learns nothing
-        // about which routes exist.
-        if (req.headers[PROBE_HEADER] !== nonce) {
+        // about which routes exist. Probing stays a loopback-browser feature:
+        // the WSL origin is for reading the page, not spending credits.
+        if (req.headers[PROBE_HEADER] !== nonce || !originIsLoopback(req.headers.origin)) {
           writeJson(res, 403, { error: 'request-not-trusted' })
           return
         }
@@ -408,9 +624,31 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
           writeJson(res, 415, { error: 'Content-Type must be application/json' })
           return
         }
-        const request = parseProbeRequest(await readBody(req))
+        const request = parseProbeRequest(await readBody(req, PROBE_BODY_LIMIT))
         const result = await probe(request)
         writeJson(res, 200, { ...result, detail: redactForBrowser(result.detail) })
+        return
+      }
+      if (req.method === 'POST' && (path === '/api/providers/save' || path === '/api/providers/remove')) {
+        if (!managementGate(req, nonce)) {
+          writeJson(res, 403, { error: 'request-not-trusted' })
+          return
+        }
+        if (providers === undefined) {
+          writeJson(res, 501, { error: 'provider management is not available' })
+          return
+        }
+        const type = req.headers['content-type']
+        if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+          writeJson(res, 415, { error: 'Content-Type must be application/json' })
+          return
+        }
+        const raw = await readBody(req, MANAGEMENT_BODY_LIMIT)
+        if (path === '/api/providers/save') {
+          writeJson(res, 200, await providers.save(parseSaveBody(raw)))
+        } else {
+          writeJson(res, 200, await providers.remove(parseRemoveBody(raw)))
+        }
         return
       }
       writeJson(res, 405, { error: 'method not allowed' })
@@ -419,10 +657,44 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
         writeJson(res, error.status, { error: error.message })
         return
       }
+      if (isManagementRoute(req) && !res.headersSent) {
+        // Known manager rejections carry their own status and a message
+        // written to be shown; matched by instanceof against the store's
+        // class, never structurally — a raw error that merely names itself
+        // alike could carry a key in its message. Anything else the manager
+        // threw is answered generically and dropped entirely — not echoed to
+        // the browser AND not written to the host log, because a failure in
+        // the middle of a save can quote the key being saved, and no regex
+        // redaction can be trusted on arbitrary user material. The generic
+        // answer is all either side learns.
+        if (error instanceof ProviderManagementError) {
+          writeJson(res, error.status, { error: error.message })
+          return
+        }
+        writeJson(res, 500, { error: 'provider management failed' })
+        return
+      }
       logger?.warn('workbuddy-bridge: UI request failed', error)
       if (!res.headersSent) writeJson(res, 500, { error: 'internal' })
       else res.end()
     }
+  }
+
+  /** Which paths are management, so their error handling is secrecy-first. */
+  function isManagementRoute(req: IncomingMessage): boolean {
+    const path = (req.url ?? '/').split('?')[0]
+    return req.method === 'GET' && path === '/api/providers'
+      || req.method === 'POST' && (path === '/api/providers/save' || path === '/api/providers/remove')
+  }
+
+  /**
+   * The management gate: the page nonce plus, when a browser sent an Origin,
+   * an exact match against the host-configured UI origins (or this server's
+   * own loopback origin). Merely-loopback origins are not management origins.
+   */
+  function managementGate(req: IncomingMessage, expected: string): boolean {
+    if (req.headers[PROBE_HEADER] !== expected) return false
+    return managementOriginAllowed(req, allowedUiOrigins)
   }
 
   return {
@@ -587,6 +859,51 @@ const PAGE = `<!doctype html>
   .chip.warn { color: var(--warn); border-color: var(--warn); }
   .chip .code { color: inherit; opacity: .7; margin-left: 4px; }
   .arrow { color: var(--dim); margin: 0 6px; }
+  /* --- provider management --- */
+  .add-bar { display: flex; justify-content: flex-start; padding: 2px 0; }
+  .dialog-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 20;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  /* A hidden attribute alone is not enough here: the author display:flex rule
+     above beats the UA stylesheet's [hidden] rule, and both dialogs would sit
+     open over the page from the first paint, blocking every click below them. */
+  .dialog-backdrop[hidden] { display: none; }
+  .dialog {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    width: 520px; max-width: 100%; max-height: 90vh; overflow: auto; padding: 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.4);
+  }
+  .dialog h2 { font-size: 14px; font-weight: 500; margin: 0 0 12px; }
+  .dialog .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .dialog .field > span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .dialog .field .hint { font-size: 11px; color: var(--dim); text-transform: none; letter-spacing: 0; }
+  .dialog input, .dialog textarea {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; width: 100%; box-sizing: border-box;
+  }
+  .dialog textarea { font-family: inherit; min-height: 90px; resize: vertical; }
+  .dialog input:focus, .dialog textarea:focus { outline: none; border-color: var(--accent); }
+  .dialog .radio-row { display: flex; gap: 16px; align-items: center; }
+  .dialog .radio-row label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--fg); }
+  .dialog .error-line { color: var(--bad); font-size: 12px; margin: 0 0 10px; min-height: 1em;
+                        overflow-wrap: anywhere; }
+  .dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+  .dialog .buttons .primary { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .dialog .buttons .danger { color: var(--bg); background: var(--bad); border-color: var(--bad); }
+  .dialog .confirm-text { font-size: 13px; color: var(--fg); margin: 0 0 6px; overflow-wrap: anywhere; }
+  .dialog .confirm-sub { font-size: 12px; color: var(--muted); margin: 0 0 10px; overflow-wrap: anywhere; }
+  /* A persistent publication warning, fixed above everything so it survives
+     the #app poll rewrite and stays visible over cards and dialogs alike. */
+  #provider-warning {
+    position: sticky; top: 0; z-index: 10; display: none;
+    padding: 10px 24px; font-size: 12px; color: var(--warn);
+    background: var(--panel-2); border-bottom: 1px solid var(--warn);
+    overflow-wrap: anywhere;
+  }
+  #provider-warning.active { display: block; }
+  .dialog p { overflow-wrap: anywhere; }
   footer { padding: 0 24px 32px; }
 </style>
 </head>
@@ -597,11 +914,64 @@ const PAGE = `<!doctype html>
   <span class="spacer"></span>
   <span class="dim" id="updated"></span>
   <button id="refresh">Refresh</button>
+  <button id="add-provider" hidden>Add provider</button>
 </header>
+<!-- Publication warning: lives outside #app so the poll rewrite can never
+     drop it, and the text is a host-owned safe status string, never error
+     detail. Rendered via textContent by the poll's render() pass. -->
+<div id="provider-warning" role="alert"></div>
 <main id="app"></main>
-<footer><p class="dim">A test sends one real chat turn through that account's own endpoint — it spends a few credits and does not move the pool's head.</p></footer>
+<footer><p class="dim" id="pool-note"></p></footer>
+<!-- The editor and its confirmation live outside #app on purpose: the 5s poll
+     rewrites #app's innerHTML, and a dialog whose DOM was rebuilt under the
+     user would drop the sentence being typed. -->
+<div id="editor-backdrop" class="dialog-backdrop" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+    <h2 id="editor-title"></h2>
+    <div class="error-line" id="editor-error" role="alert"></div>
+    <label class="field"><span>Name</span>
+      <input id="editor-name" type="text" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field"><span>API base URL</span>
+      <input id="editor-baseurl" type="text" autocomplete="off" spellcheck="false"
+             placeholder="https://api.example.com/v1">
+    </label>
+    <label class="field"><span>API key</span>
+      <span class="hint" id="editor-key-hint"></span>
+      <input id="editor-key" type="password" autocomplete="new-password" spellcheck="false">
+    </label>
+    <div class="field"><span>Models (one per line)</span>
+      <textarea id="editor-models" spellcheck="false" aria-label="Models, one per line"></textarea>
+    </div>
+    <fieldset class="field" style="border:0;padding:0;margin:0 0 12px;">
+      <legend style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;padding:0;">Authentication</legend>
+      <div class="radio-row">
+        <label><input type="radio" name="editor-authmode" id="editor-auth-key" value="api-key"> API key</label>
+        <label><input type="radio" name="editor-authmode" id="editor-auth-none" value="none"> No authentication</label>
+      </div>
+    </fieldset>
+    <div class="buttons">
+      <button id="editor-cancel">Cancel</button>
+      <button id="editor-save" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+<div id="remove-backdrop" class="dialog-backdrop" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="remove-title">
+    <h2 id="remove-title">Remove provider</h2>
+    <div class="error-line" id="remove-error" role="alert"></div>
+    <p class="confirm-text" id="remove-text"></p>
+    <p class="confirm-sub">Active requests through this provider stop. Its entry and saved key are deleted;
+       add it again if you change your mind.</p>
+    <div class="buttons">
+      <button id="remove-cancel">Cancel</button>
+      <button id="remove-confirm" class="danger">Remove</button>
+    </div>
+  </div>
+</div>
 <script>
 var UI_NONCE = "__UI_NONCE__";
+var MANAGE = "__MANAGE__";
 function esc(v) {
   return String(v).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -678,7 +1048,13 @@ function creditsBlock(ep) {
   }
   return html;
 }
-function modelsTable(models) {
+function modelsTable(models, generic) {
+  if (generic) {
+    if (!models.length) return '<div class="notice">No models. Set the configured API key environment variable.</div>';
+    var configured = '<table><thead><tr><th>Configured model ID</th></tr></thead><tbody>';
+    for (var c = 0; c < models.length; c++) configured += '<tr><td class="mono">' + esc(models[c].id) + '</td></tr>';
+    return configured + '</tbody></table>';
+  }
   if (!models.length) {
     return '<div class="notice">No models. This product has no usable credential, so the list is empty by design rather than broken.</div>';
   }
@@ -772,26 +1148,30 @@ function modelPicker(ep) {
 function poolBlock(ep) {
   var p = ep.pool;
   if (!p || !p.members || !p.members.length) return '';
-  var html = '<div class="notice">One endpoint over ' + p.members.length + ' accounts. The next request is answered by '
-    + '<strong>' + esc(memberLabel(p, p.headIndex)) + '</strong>. A test runs against that account only — '
-    + 'it does not move the head.</div>';
+  var providers = p.kind === 'providers';
+  var html = '<div class="notice">One endpoint over ' + p.members.length + (providers ? ' providers' : ' accounts')
+    + '. The next request is answered by '
+    + '<strong>' + esc(memberLabel(p, p.headIndex)) + '</strong>. A test runs against that '
+    + (providers ? 'provider' : 'account') + ' only — it does not move the head.</div>';
   /* The test controls live here rather than in the card head: they act on the
      member table below them, and a header control that does nothing on the
      Models tab would be a dead button. */
   html += '<div class="toolbar">' + modelPicker(ep)
     + '<button class="test-all" data-test-all="' + esc(ep.provider) + '">Test all</button></div>';
-  html += '<table class="members"><thead><tr><th>Account</th><th>State</th>'
-        + '<th class="num">Credits</th><th>Last routed turn</th><th>Test</th></tr></thead><tbody>';
+  html += '<table class="members"><thead><tr><th>' + (providers ? 'Provider' : 'Account') + '</th><th>State</th>'
+        + '<th class="num">Credits</th><th>Last routed turn</th><th>Test</th>'
+        + (providers ? '<th>Manage</th>' : '') + '</tr></thead><tbody>';
   for (var i = 0; i < p.members.length; i++) {
     var m = p.members[i];
     var t = testOf(ep.provider, m.index);
     var busy = t !== undefined && t.running;
     var state = '<div class="who">'
-      + '<span class="pill ' + (m.signedIn ? 'ok' : 'bad') + '">' + (m.signedIn ? 'signed in' : 'signed out') + '</span>';
+      + '<span class="pill ' + (m.signedIn ? 'ok' : 'bad') + '">'
+      + (m.signedIn ? (providers ? 'ready' : 'signed in') : (providers ? 'no key' : 'signed out')) + '</span>';
     if (m.head) {
       state += m.signedIn
         ? '<span class="pill head">next</span>'
-        : '<span class="pill warn">next · signed out</span>';
+        : '<span class="pill warn">next · ' + (providers ? 'no key' : 'signed out') + '</span>';
     }
     if (m.consecutiveFailures > 0) {
       state += '<span class="pill bad">' + m.consecutiveFailures + ' fail in a row</span>';
@@ -800,15 +1180,28 @@ function poolBlock(ep) {
     html += '<tr' + (m.head ? ' class="head"' : '') + '>'
           + '<td><div class="who"><span class="name">' + esc(m.label) + '</span>'
           + (m.uid ? '<span class="sub">' + esc(m.uid) + '</span>' : '')
-          + '<span class="sub">' + esc(m.baseUrl) + '</span></div></td>'
+          + '</div></td>'
           + '<td>' + state + '</td>'
-          + '<td class="num">' + creditsCell(m) + '</td>'
+          + '<td class="num">' + (providers ? '<span class="no">—</span>' : creditsCell(m)) + '</td>'
           + '<td>' + attemptCell(m) + '</td>'
           + '<td><button class="test" data-test-provider="' + esc(ep.provider) + '" data-test-index="' + m.index + '"'
           + (busy ? ' disabled' : '') + '>' + (busy ? 'testing…' : 'Test') + '</button>'
-          + resultCell(ep.provider, m.index) + '</td></tr>';
+          + resultCell(ep.provider, m.index) + '</td>'
+          + (providers ? '<td>' + manageCell(m) + '</td>' : '')
+          + '</tr>';
   }
   return html + '</tbody></table>';
+}
+/* A pool row that is also a provider card gets the same controls here, so a
+   provider can be edited from the pool it belongs to as well as from its own
+   card. An externally configured provider has no entry to edit, so it gets the
+   same read-only note its card carries. */
+function manageCell(m) {
+  if (m.editId) {
+    return '<button data-edit-provider="' + esc(m.editId) + '">Edit</button> '
+      + '<button data-remove-provider="' + esc(m.editId) + '">Remove</button>';
+  }
+  return '<span class="pill">externally configured · read-only</span>';
 }
 /* One member's attempt, as a chip. The class carries the verdict so the chain
    reads at a glance: green answered, red refused, amber could not sign in. */
@@ -866,13 +1259,16 @@ function requestsTable(ep) {
  * the 5s poll rebuilds the card, and a tab that jumped back to Account on
  * every refresh would be unusable.
  */
-var activeTabs = {};
-var showAccounts = false;
+var activeTabs = Object.create(null);
 function tabOf(provider) { return activeTabs[provider] || 'account'; }
 function tabStrip(ep) {
   var active = tabOf(ep.provider);
+  var providerPool = ep.pool !== undefined && ep.pool.kind === 'providers';
   var tabs = [
-    { id: 'account', label: 'Account' },
+    {
+      id: 'account',
+      label: providerPool ? 'Providers' : 'Account'
+    },
     { id: 'models', label: 'Models', count: (ep.models || []).length },
     { id: 'logs', label: 'Logs', count: (ep.requests || []).length }
   ];
@@ -892,26 +1288,38 @@ function panel(name, active, inner) {
     + ' data-panel="' + name + '" role="tabpanel">' + inner + '</div>';
 }
 function accountPanel(ep) {
+  if (ep.pool && ep.pool.kind === 'providers') {
+    var providerNotice = 'One endpoint over ' + ep.pool.members.length + ' custom providers with failover. '
+      + 'A request goes to the provider that offers its model; when that provider refuses in a way another '
+      + 'could survive, the next one is tried. Models come from the saved configurations and changes are live at once. '
+      + 'The Local bridge API key above is the local bridge token, not any upstream key.';
+    return (ep.error ? noticeOf(ep.error, true) : '') + '<div class="notice">' + providerNotice + '</div>' + poolBlock(ep);
+  }
   var html = '';
   var meta = [];
   if (ep.catalogSource) meta.push('catalog: ' + ep.catalogSource);
   if (ep.catalogFetchedAtMs) meta.push('fetched ' + fmtTime(ep.catalogFetchedAtMs));
-  if (ep.source) meta.push('credential: ' + ep.source);
-  if (ep.expiresAtMs) meta.push('expires ' + fmtTime(ep.expiresAtMs));
   if (meta.length) html += '<div class="meta">' + esc(meta.join('  ·  ')) + '</div>';
   if (ep.error) html += noticeOf(ep.error, true);
-  html += creditsBlock(ep);
   html += poolBlock(ep);
   return html;
 }
 function renderCard(ep) {
   var active = tabOf(ep.provider);
+  var providerPool = ep.pool !== undefined && ep.pool.kind === 'providers';
   var html = '<section class="card" data-provider="' + esc(ep.provider) + '">';
   html += '<div class="card-head"><div class="card-title">';
   html += '<h2>' + esc(ep.displayName) + '</h2>';
-  html += '<span class="pill ' + (ep.signedIn ? 'ok' : 'bad') + '">' + (ep.signedIn ? 'signed in' : 'signed out') + '</span>';
+  var status = providerPool
+    ? (ep.signedIn ? 'configured' : 'no usable key')
+    : (ep.signedIn ? 'signed in' : 'signed out');
+  var generic = providerPool;
+  html += '<span class="pill ' + (ep.signedIn ? 'ok' : 'bad') + '">' + status + '</span>';
   if (ep.nickname) html += '<span class="pill">' + esc(ep.nickname) + '</span>';
   if (ep.domain) html += '<span class="pill">' + esc(ep.domain) + '</span>';
+  /* Every card is a pool card now, so the card-level Edit/Remove buttons go:
+     the provider pool's members are edited from the table below, and an
+     account pool is managed from the WorkBuddy app, not this page. */
   html += '</div>';
   if (ep.baseUrl || ep.token) {
     html += '<div class="connection">';
@@ -924,7 +1332,10 @@ function renderCard(ep) {
         + '<input readonly value="' + esc(ep.wslBaseUrl) + '" onclick="this.select()"></label>';
     }
     if (ep.token) {
-      html += '<label><span class="conn-label">API Key</span>'
+      /* "Local bridge API key", not just "API Key": the editor below also has
+         an API-key field for the upstream credential, and the two must not be
+         mistakable for each other. */
+      html += '<label><span class="conn-label">Local bridge API key</span>'
         + '<input readonly value="' + esc(ep.token) + '" onclick="this.select()"></label>';
     }
     html += '</div>';
@@ -932,40 +1343,52 @@ function renderCard(ep) {
   html += tabStrip(ep);
   html += '</div>';
   html += panel('account', active, accountPanel(ep));
-  html += panel('models', active, modelsTable(ep.models || []));
+  html += panel('models', active, modelsTable(ep.models || [], generic));
   html += panel('logs', active, requestsTable(ep));
   html += '</section>';
   return html;
 }
 function render(state) {
   lastState = state;
+  /* The publication warning is host-owned text (a fixed safe status string,
+     never error detail) set on the state document after a mutation whose
+     publication failed, and cleared when publication later succeeds. It is
+     set via textContent outside #app, so it persists across polls. */
+  var banner = document.getElementById('provider-warning');
+  if (state.providerWarning) {
+    banner.textContent = state.providerWarning;
+    banner.className = 'active';
+  } else {
+    banner.textContent = '';
+    banner.className = '';
+  }
+  var poolEndpoints = (state.endpoints || []).filter(function (ep) { return ep.pool !== undefined; });
+  var providerPoolShown = poolEndpoints.some(function (ep) { return ep.pool.kind === 'providers'; });
+  var accountPoolShown = poolEndpoints.some(function (ep) { return ep.pool.kind !== 'providers'; });
+  document.getElementById('pool-note').textContent = providerPoolShown
+    ? "A test sends one real chat turn through that provider's own upstream — it spends a few credits there and does not move the pool's head."
+    : accountPoolShown
+      ? "A test sends one real chat turn through that account's own upstream path — it spends a few credits and does not move the pool's head."
+      : '';
   document.getElementById('version').textContent = 'v' + (state.version === 1 ? '1' : '?');
   document.getElementById('updated').textContent = 'updated ' + new Date(state.nowMs).toLocaleTimeString();
+  document.getElementById('add-provider').hidden = !MANAGE;
   var app = document.getElementById('app');
   if (!state.endpoints || !state.endpoints.length) {
-    app.innerHTML = '<div class="notice">No endpoints are being served.</div>';
+    app.innerHTML = '<div class="notice">' + (MANAGE
+      ? 'No endpoints are being served. Add a provider to serve one.'
+      : 'No endpoints are being served.') + '</div>';
     return;
   }
-  var pools = [];
-  var accounts = [];
-  for (var i = 0; i < state.endpoints.length; i++) {
-    var ep = state.endpoints[i];
-    if (ep.pool !== undefined) pools.push(ep);
-    else accounts.push(ep);
-  }
+  /* Every card is a pool card. The custom-provider pool comes first: it is
+     the endpoint an agent should use when several providers exist, so it must
+     not sit below the other cards. */
+  var pools = (state.endpoints || []).slice();
+  pools.sort(function (a, b) {
+    return (b.pool && b.pool.kind === 'providers' ? 1 : 0) - (a.pool && a.pool.kind === 'providers' ? 1 : 0);
+  });
   var html = '';
   for (var p = 0; p < pools.length; p++) html += renderCard(pools[p]);
-  /* A global toggle is cleaner than one per card: the question is "do I want
-     to see the individual accounts at all?" not "do I want to see alice?". */
-  if (accounts.length) {
-    html += '<div class="account-toggle-bar">'
-      + '<button class="account-toggle" data-toggle-accounts="1">'
-      + (showAccounts ? 'Hide accounts' : 'Show ' + accounts.length + ' account' + (accounts.length > 1 ? 's' : ''))
-      + '</button></div>';
-    if (showAccounts) {
-      for (var a = 0; a < accounts.length; a++) html += renderCard(accounts[a]);
-    }
-  }
   app.innerHTML = html;
 }
 
@@ -1028,12 +1451,6 @@ document.getElementById('app').addEventListener('click', function (event) {
      and clicking the number must switch the tab like clicking the word. */
   var button = event.target && event.target.closest ? event.target.closest('button') : null;
   if (!button) return;
-  /* Global show/hide for individual account cards. Pools are always visible. */
-  if (button.dataset.toggleAccounts !== undefined) {
-    showAccounts = !showAccounts;
-    if (lastState) render(lastState);
-    return;
-  }
   /* A tab switch is a class toggle rather than a re-render: it keeps the
      scroll position, and it cannot race the 5s poll into showing the wrong
      panel. The choice is recorded so the next poll rebuilds it open. */
@@ -1056,6 +1473,9 @@ document.getElementById('app').addEventListener('click', function (event) {
     return;
   }
   if (button.dataset.testAll !== undefined) runAll(button.dataset.testAll);
+  /* Managed cards: Edit prefills the editor, Remove opens its confirmation. */
+  if (button.dataset.editProvider !== undefined) openEditor(button.dataset.editProvider);
+  if (button.dataset.removeProvider !== undefined) openRemove(button.dataset.removeProvider);
 });
 document.getElementById('app').addEventListener('change', function (event) {
   var target = event.target;
@@ -1063,6 +1483,222 @@ document.getElementById('app').addEventListener('change', function (event) {
     chosenModels[target.dataset.modelProvider] = target.value;
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * Provider management. Everything here lives OUTSIDE #app: the editor *
+ * and its confirmation are fixed DOM, so the 5s poll can never rebuild *
+ * them under a sentence being typed. The key field is a password input *
+ * that is only read into a request body — never into render strings,  *
+ * state objects, or storage — and a close/cancel clears it.           *
+ * ------------------------------------------------------------------ */
+/* Managed ids, from /api/providers. The state document stays metadata-only
+   about management: cards look it up here rather than carrying it. */
+var managedIds = {};
+var providersList = {};
+var providerRevision = null;
+/* The revision each open dialog acts on, pinned when the dialog opens. The
+   5s poll keeps adopting newer snapshots, but a dialog the user has already
+   based edits on must not silently ride them: a save that ships a stale
+   revision would overwrite whatever changed between open and save (the
+   reviewer's r1-editor / r2-poll scenario). A conflict therefore fails and
+   asks for a reopen; it never auto-adopts. */
+var editorRevision = null;
+var removalRevision = null;
+var lastFocus = null;
+var removeTarget = null;
+var editingId = null;
+function editorEl(id) { return document.getElementById(id); }
+
+function openEditor(id) {
+  editingId = id || null;
+  var p = id ? providersList[id] : null;
+  editorRevision = providerRevision;
+  editorEl('editor-title').textContent = p ? 'Edit provider' : 'Add provider';
+  editorEl('editor-name').value = p ? p.displayName : '';
+  editorEl('editor-baseurl').value = p ? p.baseUrl : '';
+  /* The key is never round-tripped: blank keeps what is saved. */
+  editorEl('editor-key').value = '';
+  editorEl('editor-key-hint').textContent = p && p.hasApiKey
+    ? 'Leave blank to keep the saved key'
+    : '';
+  editorEl('editor-models').value = p ? p.models.join('\\n') : '';
+  editorEl(p && p.authMode === 'none' ? 'editor-auth-none' : 'editor-auth-key').checked = true;
+  editorEl('editor-error').textContent = '';
+  editorEl('editor-save').disabled = false;
+  showBackdrop('editor-backdrop');
+  editorEl('editor-name').focus();
+}
+function showBackdrop(id) {
+  var backdrop = editorEl(id);
+  backdrop.hidden = false;
+  lastFocus = document.activeElement;
+  /* Focus the dialog itself so Tab cycles inside it (simple focus trap). */
+  var dialog = backdrop.querySelector('.dialog');
+  var focusables = dialog.querySelectorAll('button, input, textarea');
+  if (focusables.length) focusables[0].focus();
+}
+function closeEditor() {
+  editorEl('editor-backdrop').hidden = true;
+  /* The key never outlives the dialog: blank it on close as well as cancel. */
+  editorEl('editor-key').value = '';
+  if (lastFocus && lastFocus.focus) lastFocus.focus();
+  lastFocus = null;
+}
+function openRemove(id) {
+  var p = providersList[id];
+  if (!p) return;
+  removeTarget = id;
+  removalRevision = providerRevision;
+  editorEl('remove-text').textContent = 'Remove ' + p.displayName + ' (' + p.id + ')?';
+  editorEl('remove-error').textContent = '';
+  editorEl('remove-confirm').disabled = false;
+  showBackdrop('remove-backdrop');
+  editorEl('remove-cancel').focus();
+}
+function closeRemove() {
+  editorEl('remove-backdrop').hidden = true;
+  removeTarget = null;
+  if (lastFocus && lastFocus.focus) lastFocus.focus();
+  lastFocus = null;
+}
+
+function authModeOf() {
+  return editorEl('editor-auth-none').checked ? 'none' : 'api-key';
+}
+/* Transport-shape validation only; the store owns URL shape, model syntax,
+   reserved ids, and collisions, and its messages are written to be shown. */
+function editorValidate() {
+  if (editorEl('editor-name').value.trim() === '') return 'Name is required.';
+  if (editorEl('editor-baseurl').value.trim() === '') return 'API base URL is required.';
+  var lines = editorEl('editor-models').value.split('\\n').map(function (line) { return line.trim(); }).filter(function (line) { return line !== ''; });
+  if (!lines.length) return 'At least one model is required.';
+  return '';
+}
+function saveEditor() {
+  var problem = editorValidate();
+  /* The save carries the revision the dialog was opened with, not the one the
+     poll has since adopted. A newer live revision means someone (another tab,
+     another mutation) changed the roster under this dialog; sending the old
+     fields with the new revision would overwrite it silently, so the conflict
+     is refused and the dialog must be reopened instead. */
+  if (editorRevision !== providerRevision) {
+    editorEl('editor-error').textContent =
+      'This provider changed since the dialog opened. Cancel and reopen to edit the current version.';
+    editorEl('editor-save').disabled = true;
+    return;
+  }
+  editorEl('editor-error').textContent = problem;
+  if (problem) return;
+  var body = {
+    revision: editorRevision,
+    displayName: editorEl('editor-name').value.trim(),
+    baseUrl: editorEl('editor-baseurl').value.trim(),
+    models: editorEl('editor-models').value.split('\\n').map(function (line) { return line.trim(); }).filter(function (line) { return line !== ''; }),
+    authMode: authModeOf()
+  };
+  var editing = editorEl('editor-title').textContent === 'Edit provider';
+  if (editing && editingId) body.id = editingId;
+  var key = editorEl('editor-key').value;
+  if (authModeOf() === 'api-key' && key !== '') body.apiKey = key;
+  editorEl('editor-save').disabled = true;
+  editorEl('editor-error').textContent = 'Saving...';
+  postManagement('/api/providers/save', body)
+    .then(function (snapshot) {
+      applySnapshot(snapshot);
+      closeEditor();
+      load();
+    })
+    .catch(function (message) {
+      editorEl('editor-error').textContent = message;
+      editorEl('editor-save').disabled = false;
+    });
+}
+function confirmRemove() {
+  if (!removeTarget) return;
+  /* Same pinning as the editor: remove with the revision the confirmation was
+     opened against, never one a later poll adopted. */
+  if (removalRevision !== providerRevision) {
+    editorEl('remove-error').textContent =
+      'The provider list changed since this was opened. Cancel and try again.';
+    editorEl('remove-confirm').disabled = true;
+    return;
+  }
+  editorEl('remove-confirm').disabled = true;
+  editorEl('remove-error').textContent = 'Removing...';
+  postManagement('/api/providers/remove', { revision: removalRevision, id: removeTarget })
+    .then(function (snapshot) {
+      applySnapshot(snapshot);
+      closeRemove();
+      load();
+    })
+    .catch(function (message) {
+      editorEl('remove-error').textContent = message;
+      editorEl('remove-confirm').disabled = false;
+    });
+}
+function postManagement(path, body) {
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Ui': UI_NONCE },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    return r.json().then(function (data) { return { status: r.status, data: data }; });
+  }).then(function (res) {
+    if (res.status === 200) return res.data;
+    throw (res.data && res.data.error) || ('HTTP ' + res.status);
+  });
+}
+function applySnapshot(snapshot) {
+  providersList = {};
+  for (var i = 0; i < snapshot.providers.length; i++) {
+    providersList[snapshot.providers[i].id] = snapshot.providers[i];
+  }
+  managedIds = Object.assign({}, providersList);
+  providerRevision = snapshot.revision;
+}
+/* The list is fetched separately from /api/state: management metadata and the
+   card document have different lifetimes, and the cards only need the ids. */
+function loadProviders() {
+  if (!MANAGE) return;
+  fetch('/api/providers', { headers: { 'X-Bridge-Ui': UI_NONCE }, cache: 'no-store' })
+    .then(function (r) {
+      if (r.status === 200) return r.json();
+      throw new Error('HTTP ' + r.status);
+    })
+    .then(applySnapshot)
+    .catch(function () { /* read-only rendering continues; retry on next poll */ })
+    .then(function () { if (lastState) render(lastState); });
+}
+editorEl('editor-cancel').addEventListener('click', closeEditor);
+editorEl('editor-save').addEventListener('click', saveEditor);
+editorEl('remove-cancel').addEventListener('click', closeRemove);
+editorEl('remove-confirm').addEventListener('click', confirmRemove);
+editorEl('add-provider').addEventListener('click', function () { openEditor(null); });
+/* Escape cancels whichever dialog is open; Tab is trapped inside it so focus
+   cannot wander behind the backdrop. */
+document.addEventListener('keydown', function (event) {
+  var openBackdrop = document.querySelector('.dialog-backdrop:not([hidden])');
+  if (!openBackdrop) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    if (openBackdrop.id === 'editor-backdrop') closeEditor(); else closeRemove();
+    return;
+  }
+  if (event.key === 'Tab') {
+    var focusables = openBackdrop.querySelectorAll('button, input, textarea');
+    if (!focusables.length) return;
+    var first = focusables[0];
+    var last = focusables[focusables.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+});
+
 var timer = null;
 function load() {
   fetch('/api/state', { cache: 'no-store' })
@@ -1075,7 +1711,11 @@ function load() {
 }
 document.getElementById('refresh').addEventListener('click', load);
 load();
+loadProviders();
 timer = setInterval(load, 5000);
+/* Keep the managed roster fresh too; the card labels are the same either way,
+   and Edit/Remove are what the ids gate. */
+setInterval(loadProviders, 5000);
 </script>
 </body>
 </html>

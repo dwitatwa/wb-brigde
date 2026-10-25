@@ -1,4 +1,4 @@
-import { B as WorkBuddyUpstreamModel, N as WorkBuddyEffort, c as WorkBuddyModelInfo, nt as ProbeSender, p as WorkBuddyCredentialStore, rt as SentinelFactory, s as WorkBuddyCatalog, tt as ProbeRegion, z as WorkBuddyUpstreamClient } from "./shim-U171C0Zy.js";
+import { B as WorkBuddyUpstreamClient, P as WorkBuddyEffort, V as WorkBuddyUpstreamModel, c as WorkBuddyCatalog, it as SentinelFactory, l as WorkBuddyModelInfo, m as WorkBuddyCredentialStore, nt as ProbeRegion, rt as ProbeSender } from "./shim-C_F_ZwL7.js";
 //#region src/core/catalog-store.d.ts
 /** Basename of the CN variant's saved catalog inside the Harness home. */
 declare const WORKBUDDY_CATALOG_FILENAME = ".workbuddy-catalog.json";

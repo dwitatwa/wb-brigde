@@ -865,6 +865,44 @@ describe('auth-failure classification beside the status-note policy (PR #58 revi
     expect(classifyUpstreamError(403, JSON.stringify({ code: 11140, msg: 'request illegal' }))).toBe('client')
   })
 
+  it('classifies an account-restriction 403 as session_dead so the pool rotates', () => {
+    // The real wire shape behind a restricted account: `request illegal` alone
+    // is request-scoped, but the display message names the *account*. The bare
+    // code stays `client`; only the restriction wording is account-scoped.
+    const restricted = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      requestId: '10ea4f7d3774d699798b4ebc90d33382',
+      displayMsg: {
+        en: 'Your account has been restricted due to unusual activity',
+        zh: '账号存在异常行为,已被限制使用',
+      },
+      actions: ['EDIT_INPUT', 'SUBMIT_FEEDBACK'],
+    })
+    expect(classifyUpstreamError(403, restricted)).toBe('session_dead')
+    expect(classifyUpstreamError(403, 'Your account has been restricted due to unusual activity')).toBe('session_dead')
+    expect(classifyUpstreamError(403, '账号存在异常行为,已被限制使用')).toBe('session_dead')
+  })
+
+  it('classifies the restriction over the chatStream path, not only the pure function', async () => {
+    // End to end: the failure the pool receives must carry the account-scoped
+    // kind, or the rotator would still stop on the restricted account.
+    const body = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayMsg: { en: 'Your account has been restricted due to unusual activity' },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => fakeResponse(body, false, 403)))
+    const result = await new WorkBuddyUpstreamClient().chatStream(CREDENTIAL, JSON.stringify({
+      model: 'probe-model',
+      messages: [{ role: 'system', content: 'You are a helpful assistant.' }, { role: 'user', content: 'hi' }],
+    }))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable: the upstream refused the turn')
+    expect(result.kind).toBe('session_dead')
+    expect(result.status).toBe(403)
+  })
+
   it('still recognises dead sessions carried by markers on other statuses', () => {
     expect(classifyUpstreamError(403, 'Offline user session not found')).toBe('session_dead')
     expect(classifyUpstreamError(200, JSON.stringify({ code: 12153 }))).toBe('session_dead')

@@ -365,6 +365,18 @@ function resolveUpstreamBilling(
 /** Session-invalidation markers that mean "sign in again in the WorkBuddy app". */
 const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found', '12153']
 
+/**
+ * Account-restriction markers: the gateway answers `403`/`request illegal`
+ * when it has restricted the account itself, not the request. The bare
+ * `11140` code stays request-scoped (`client`) — the same `msg` covers
+ * genuine input rules — but the display message names the account, and that
+ * wording is what separates "sign in differently" from "try another account".
+ */
+const ACCOUNT_RESTRICTED_MARKERS: readonly string[] = [
+  'has been restricted due to unusual activity',
+  '异常行为,已被限制使用',
+]
+
 /** Classify an upstream failure from its HTTP status and body excerpt. */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
@@ -379,6 +391,9 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
   }
   for (const marker of SESSION_DEAD_MARKERS) {
+    if (body.includes(marker)) return 'session_dead'
+  }
+  for (const marker of ACCOUNT_RESTRICTED_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
   if (status === 429) return 'soft_rate'

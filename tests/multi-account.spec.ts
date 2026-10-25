@@ -5,15 +5,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WorkBuddyBridge } from '../src/standalone/bridge.ts'
 
 /**
- * Multiple accounts of one product, served by one process.
+ * Several accounts of one product, served by one process.
  *
- * The whole feature rests on one structural claim: `startVariant` is
- * per-account, not per-variant, so N auth files produce N independent
- * runtimes — own store, own shim, own port, own token — while the variant's
- * catalog store stays shared, because its entries are keyed by account
- * identity already. These tests pin the observable consequences of that
- * split: distinct endpoints that can be told apart, and an unchanged
- * single-account surface.
+ * Each account is its own runtime — own store, own credential plane — while
+ * the variant's catalog store stays shared, because its entries are keyed by
+ * account identity already. The accounts have no endpoints of their own: the
+ * product's failover pool is the only endpoint, whatever the account count,
+ * so the URL an agent is configured with never changes when accounts come
+ * and go. These tests pin the observable consequences of that split.
  */
 
 const previousHome = process.env['WORKBUDDY_BRIDGE_HOME']
@@ -48,32 +47,31 @@ async function authFile(nickname: string, uid: string): Promise<string> {
   return path
 }
 
-function aiEndpoints(descriptor: { endpoints: Array<{ provider: string }> }): Array<Record<string, unknown>> {
-  return descriptor.endpoints.filter(endpoint => endpoint.provider === 'workbuddy-ai') as never
+function poolEndpoints(descriptor: { endpoints: Array<{ provider: string }> }): Array<Record<string, unknown>> {
+  return descriptor.endpoints.filter(endpoint => endpoint.provider.endsWith('-pool')) as never
 }
 
 describe('one bridge process serving several accounts', () => {
-  it('starts one endpoint per product with no options at all (default invocation)', async () => {
+  it('starts one pool endpoint per product with no options at all (default invocation)', async () => {
     await useTempHome()
     // No authFiles, no discovery: the ordinary `workbuddy-bridge serve` path.
-    // This regressed once — an empty account list was iterated as-is, so the
-    // default invocation started zero endpoints and exited with "no variant
-    // could start a loopback endpoint". The empty list must mean one runtime
-    // with desktop discovery, never zero.
+    // The pool is the product's only endpoint, and it exists however many
+    // accounts are signed in — here, none.
     const bridge = new WorkBuddyBridge()
     try {
       const descriptor = await bridge.start()
       expect(descriptor.endpoints.length).toBe(2)
       const providers = descriptor.endpoints.map(endpoint => endpoint.provider).sort()
-      expect(providers).toEqual(['workbuddy', 'workbuddy-ai'])
-      // Single-account mode keeps the bare product name — no account suffix.
-      for (const endpoint of descriptor.endpoints) expect(endpoint.displayName).not.toContain('·')
+      expect(providers).toEqual(['workbuddy-ai-pool', 'workbuddy-pool'])
+      for (const endpoint of descriptor.endpoints) {
+        expect(endpoint.displayName).toContain('pool')
+      }
     } finally {
       await bridge.close()
     }
   })
 
-  it('starts one endpoint per auth file, each with its own port and token', async () => {
+  it('serves several auth files through one pool endpoint, one member each', async () => {
     await useTempHome()
     const first = await authFile('alice', 'uid-a')
     const second = await authFile('bob', 'uid-b')
@@ -82,21 +80,25 @@ describe('one bridge process serving several accounts', () => {
     })
     try {
       const descriptor = await bridge.start()
-      const endpoints = aiEndpoints(descriptor)
-      expect(endpoints.length).toBe(2)
-      const urls = new Set(endpoints.map(endpoint => endpoint.baseUrl))
-      const tokens = new Set(endpoints.map(endpoint => endpoint.token))
-      // Distinct shims mean distinct ports and distinct per-process secrets;
-      // sharing either would mean the accounts share a credential plane.
-      expect(urls.size).toBe(2)
-      expect(tokens.size).toBe(2)
-      for (const endpoint of endpoints) expect(endpoint.signedIn).toBe(true)
+      // Two pools: one per product, each its own endpoint. Only the AI pool
+      // has signed-in members.
+      const pools = poolEndpoints(descriptor)
+      expect(pools).toHaveLength(2)
+      expect(descriptor.endpoints).toHaveLength(2)
+      const aiPool = pools.find(ep => ep['provider'] === 'workbuddy-ai-pool')!
+      // The AI pool carries its own port and per-process secret.
+      expect(aiPool['signedIn']).toBe(true)
+      const state = await bridge.uiState()
+      const pool = state.endpoints.find(ep => ep.provider === 'workbuddy-ai-pool')!
+      expect(pool.pool!.members.map(member => member.label)).toEqual(['alice', 'bob'])
+      expect(pool.pool!.members.map(member => member.signedIn)).toEqual([true, true])
+      expect(pool.pool!.headIndex).toBe(0)
     } finally {
       await bridge.close()
     }
   })
 
-  it('labels multi-account endpoints by nickname, keeping the provider id stable', async () => {
+  it('labels pool members by nickname', async () => {
     await useTempHome()
     const first = await authFile('alice', 'uid-a')
     const second = await authFile('bob', 'uid-b')
@@ -104,20 +106,19 @@ describe('one bridge process serving several accounts', () => {
       authFiles: new Map([['workbuddy-ai', [first, second]]]),
     })
     try {
-      const descriptor = await bridge.start()
-      const names = aiEndpoints(descriptor).map(endpoint => endpoint.displayName).sort()
-      // Both endpoints still answer to provider `workbuddy-ai` — tooling that
-      // groups by provider keeps working — while the display name says whose
-      // credentials each one speaks for.
-      expect(names[0]).toContain('alice')
-      expect(names[1]).toContain('bob')
-      for (const endpoint of aiEndpoints(descriptor)) expect(endpoint.provider).toBe('workbuddy-ai')
+      await bridge.start()
+      const state = await bridge.uiState()
+      const pool = state.endpoints.find(ep => ep.provider === 'workbuddy-ai-pool')!
+      const labels = pool.pool!.members.map(member => member.label)
+      expect(labels).toContain('alice')
+      expect(labels).toContain('bob')
+      expect(pool.provider).toBe('workbuddy-ai-pool')
     } finally {
       await bridge.close()
     }
   })
 
-  it('keeps the single-account surface unchanged: bare product name, one endpoint', async () => {
+  it('serves a single account through the pool, with no per-account endpoint', async () => {
     await useTempHome()
     const only = await authFile('alice', 'uid-a')
     const bridge = new WorkBuddyBridge({
@@ -125,38 +126,31 @@ describe('one bridge process serving several accounts', () => {
     })
     try {
       const descriptor = await bridge.start()
-      const endpoints = aiEndpoints(descriptor)
-      expect(endpoints.length).toBe(1)
-      // No suffix when there is nothing to disambiguate — the common case
-      // must render exactly as it did before multi-account existed.
-      expect(endpoints[0]!.displayName).not.toContain('·')
-      expect(endpoints[0]!.displayName).not.toContain('alice')
+      // Two pools (one per product, however few members); only the AI pool is signed in.
+      expect(descriptor.endpoints.map(endpoint => endpoint.provider)).toEqual(['workbuddy-pool', 'workbuddy-ai-pool'])
+      expect(descriptor.endpoints[0]!.signedIn).toBe(false)
+      expect(descriptor.endpoints[1]!.signedIn).toBe(true)
     } finally {
       await bridge.close()
     }
   })
 
-  it('shuts every account endpoint down on close', async () => {
+  it('shuts the pool down on close', async () => {
     await useTempHome()
     const first = await authFile('alice', 'uid-a')
     const second = await authFile('bob', 'uid-b')
     const bridge = new WorkBuddyBridge({
       authFiles: new Map([['workbuddy-ai', [first, second]]]),
     })
-    const descriptor = await bridge.start()
-    const ports = aiEndpoints(descriptor).map(endpoint => new URL(endpoint.baseUrl as string).port)
-    expect(ports.length).toBe(2)
+    await bridge.start()
+    const port = new URL(bridge.endpoints()[0]!.baseUrl).port
     await bridge.close()
-    // Every account's listener must be gone, not just the last one started —
-    // close() iterates the runtime list, and this pins that the list holds
-    // one entry per account.
-    for (const port of ports) {
-      const socket = await new Promise<import('node:net').Socket | undefined>(resolve => {
-        const net = require('node:net') as typeof import('node:net')
-        const s = net.connect({ host: '127.0.0.1', port: Number(port) }, () => { s.destroy(); resolve(s) })
-        s.once('error', () => resolve(undefined))
-      })
-      expect(socket).toBeUndefined()
-    }
+    // The pool's listener must be gone from the wire.
+    const socket = await new Promise<import('node:net').Socket | undefined>(resolve => {
+      const net = require('node:net') as typeof import('node:net')
+      const s = net.connect({ host: '127.0.0.1', port: Number(port) }, () => { s.destroy(); resolve(s) })
+      s.once('error', () => resolve(undefined))
+    })
+    expect(socket).toBeUndefined()
   })
 })

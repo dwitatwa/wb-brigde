@@ -1,3 +1,4 @@
+import { ServerResponse } from "node:http";
 //#region src/core/status-paths.d.ts
 /**
  * Why no credential is usable, as a closed enum the browser half switches on.
@@ -1298,6 +1299,28 @@ interface WorkBuddyShimOptions {
   client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
   catalog: WorkBuddyCatalog;
   logger?: ShimLogger;
+  /**
+   * Preferred loopback port, so a restart can keep the address clients are
+   * already configured with. A taken port falls back to an ephemeral one.
+   */
+  port?: number;
+  /**
+   * Preferred bearer secret, so a restart can keep the token clients already
+   * hold. Absent means a fresh random secret for this process.
+   */
+  token?: string;
+}
+/**
+ * The neutral loopback endpoint the WorkBuddy shim and the custom
+ * OpenAI-compatible provider endpoint are both built on. It owns the
+ * listener, the per-process secret, the inbound gates, the shared route
+ * skeleton, and body reading; the flavor supplies only what routes exist.
+ */
+interface LoopbackEndpoint {
+  ready: Promise<void>;
+  baseUrl(): string;
+  token(): string;
+  close(): Promise<void>;
 }
 /**
  * Start the loopback endpoint. Requests carry any bearer; the loopback bind
@@ -1305,4 +1328,4 @@ interface WorkBuddyShimOptions {
  */
 declare function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim;
 //#endregion
-export { ProbeAttempt as $, WorkBuddyCatalogFetch as A, WorkBuddyUpstreamModel as B, CN_VARIANT as C, electronProfileFor as D, WorkBuddyVariant as E, WorkBuddyModelReasoning as F, normalizeCredits as G, extractDisplayErrorMessage as H, WorkBuddyPromotion as I, prepareCnChatBody as J, parseModelCatalog as K, WorkBuddyRefreshOutcome as L, WorkBuddyCredits as M, WorkBuddyEffort as N, variantFor as O, WorkBuddyModelBilling as P, PROBE_EFFORT_CANDIDATES as Q, WorkBuddyRegion as R, AI_VARIANT as S, validAppVersion as St, WorkBuddyElectronProduct as T, isChannelValidationBlock as U, classifyUpstreamError as V, modelWithCurrentPromotion as W, regionOf as X, prepareInternationalChatBody as Y, upstreamErrorCode as Z, desktopAuthCandidatesFor as _, WorkBuddyAppVersionSource as _t, FALLBACK_WORKBUDDY_AI_MODELS as a, randomSentinel as at, WorkBuddyAtRestKeyProvider as b, readBundleVersion as bt, WorkBuddyModelInfo as c, FALLBACK_CN_APP_VERSION as ct, WorkBuddyAuthStatus as d, fallbackChatIdentity as dt, ProbeOutcome as et, WorkBuddyCredential as f, readCliVersion as ft, defaultDesktopAuthPath as g, WORKBUDDY_APP_VERSION_FILENAME as gt, defaultDesktopAuthCandidates as h, AppVersionInfo as ht, createWorkBuddyShim as i, probeModel as it, WorkBuddyChatResult as j, UpstreamErrorKind as k, WORKBUDDY_AUTH_FILENAME as l, ResolveChatIdentityOptions as lt, WorkBuddyStoreOptions as m, validCliVersion as mt, WorkBuddyShim as n, ProbeSender as nt, FALLBACK_WORKBUDDY_MODELS as o, CN_APP_VERSION_FILENAME as ot, WorkBuddyCredentialStore as p, resolveChatIdentity as pt, prepareChatBody as q, WorkBuddyShimOptions as r, SentinelFactory as rt, WorkBuddyCatalog as s, ChatIdentity as st, ShimLogger as t, ProbeRegion as tt, WORKBUDDY_AUTH_FILE_ENV as u, chatUserAgent as ut, parseWorkBuddyAuth as v, appUserAgent as vt, WORKBUDDY_VARIANTS as w, atRestKeyProviderFor as x, resolveAppVersion as xt, workbuddyOwnAuthPath as y, installedAppVersion as yt, WorkBuddyUpstreamClient as z };
+export { PROBE_EFFORT_CANDIDATES as $, UpstreamErrorKind as A, WorkBuddyUpstreamClient as B, AI_VARIANT as C, validAppVersion as Ct, WorkBuddyVariant as D, WorkBuddyElectronProduct as E, WorkBuddyModelBilling as F, modelWithCurrentPromotion as G, classifyUpstreamError as H, WorkBuddyModelReasoning as I, prepareChatBody as J, normalizeCredits as K, WorkBuddyPromotion as L, WorkBuddyChatResult as M, WorkBuddyCredits as N, electronProfileFor as O, WorkBuddyEffort as P, upstreamErrorCode as Q, WorkBuddyRefreshOutcome as R, atRestKeyProviderFor as S, resolveAppVersion as St, WORKBUDDY_VARIANTS as T, extractDisplayErrorMessage as U, WorkBuddyUpstreamModel as V, isChannelValidationBlock as W, prepareInternationalChatBody as X, prepareCnChatBody as Y, regionOf as Z, defaultDesktopAuthPath as _, WORKBUDDY_APP_VERSION_FILENAME as _t, createWorkBuddyShim as a, probeModel as at, workbuddyOwnAuthPath as b, installedAppVersion as bt, WorkBuddyCatalog as c, ChatIdentity as ct, WORKBUDDY_AUTH_FILE_ENV as d, chatUserAgent as dt, ProbeAttempt as et, WorkBuddyAuthStatus as f, fallbackChatIdentity as ft, defaultDesktopAuthCandidates as g, AppVersionInfo as gt, WorkBuddyStoreOptions as h, validCliVersion as ht, WorkBuddyShimOptions as i, SentinelFactory as it, WorkBuddyCatalogFetch as j, variantFor as k, WorkBuddyModelInfo as l, FALLBACK_CN_APP_VERSION as lt, WorkBuddyCredentialStore as m, resolveChatIdentity as mt, ShimLogger as n, ProbeRegion as nt, FALLBACK_WORKBUDDY_AI_MODELS as o, randomSentinel as ot, WorkBuddyCredential as p, readCliVersion as pt, parseModelCatalog as q, WorkBuddyShim as r, ProbeSender as rt, FALLBACK_WORKBUDDY_MODELS as s, CN_APP_VERSION_FILENAME as st, LoopbackEndpoint as t, ProbeOutcome as tt, WORKBUDDY_AUTH_FILENAME as u, ResolveChatIdentityOptions as ut, desktopAuthCandidatesFor as v, WorkBuddyAppVersionSource as vt, CN_VARIANT as w, WorkBuddyAtRestKeyProvider as x, readBundleVersion as xt, parseWorkBuddyAuth as y, appUserAgent as yt, WorkBuddyRegion as z };
