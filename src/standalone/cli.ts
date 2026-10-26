@@ -66,6 +66,8 @@ Options:
   --all-accounts            serve every account found in the desktop auth
                             directory (explicit --auth-file* flags win for
                             the product they name)
+  --no-accounts-ui          do not keep or expose the bridge-owned account
+                            folder, and show no account controls in the page
   --no-coalesce-reasoning   forward reasoning deltas exactly as the upstream
                             sends them (by default tiny per-word deltas are
                             regrouped, so clients show paragraphs rather than
@@ -107,6 +109,8 @@ interface ParsedArgs {
   wsl: boolean
   /** Discover and serve every account in the desktop auth directory. */
   allAccounts: boolean
+  /** Keep and expose the bridge-owned account folder. */
+  accountsUi: boolean
   /** Forward reasoning deltas exactly as received. */
   noCoalesceReasoning: boolean
   providerIds: string[]
@@ -132,6 +136,7 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
     ui: false,
     wsl: false,
     allAccounts: false,
+    accountsUi: true,
     noCoalesceReasoning: false,
     providerIds: [],
     config: undefined,
@@ -169,6 +174,9 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
         break
       case '--all-accounts':
         args.allAccounts = true
+        break
+      case '--no-accounts-ui':
+        args.accountsUi = false
         break
       case '--no-coalesce-reasoning':
         args.noCoalesceReasoning = true
@@ -512,6 +520,11 @@ async function serve(args: ParsedArgs): Promise<void> {
     // providers stay read-only as served; a saved provider with the same id
     // is an explicit collision error, not a silent overwrite.
     manageProviders: true,
+    // The bridge-owned account folder, on for the same reason: `ui` alone is
+    // enough to add or remove an account, and `serve` agrees with it on what
+    // is being served. `--no-accounts-ui` turns both the folder and its routes
+    // off, for a deployment that wants no writable credential state.
+    manageAccounts: args.accountsUi,
     // Stable addresses by default: a client configured once keeps working
     // across restarts. `--no-descriptor` keeps its promise of an
     // in-memory-only secret, so only the ports are reused in that mode.
@@ -595,6 +608,22 @@ async function serve(args: ParsedArgs): Promise<void> {
             return publishAfterMutation(bridge, runtime).then(() => snapshot)
           }),
         },
+        // WorkBuddy accounts: list, add, remove the bridge's own copies, and
+        // rescan for an account signed in since startup. A rescan adds pool
+        // members without rebuilding the listener, so the published base URL
+        // and token stay the same. `--no-accounts-ui` leaves this surface out
+        // entirely, so the page shows no controls and the routes do not exist.
+        ...args.accountsUi ? {
+          accounts: {
+            list: () => bridge.listStoredAccounts(),
+            import: (input: { text: string, origin?: string }) => bridge.importStoredAccount(input).then(account =>
+              publishAfterMutation(bridge, runtime).then(() => account)),
+            remove: (uid: string) => bridge.removeStoredAccount(uid).then(result =>
+              publishAfterMutation(bridge, runtime).then(() => result)),
+            rescan: () => bridge.rescanAccounts().then(result =>
+              publishAfterMutation(bridge, runtime).then(() => result)),
+          },
+        } : {},
         // Exact origins the page is additionally served from — the WSL
         // forwarder's URL, known only after the forwarders bind. Evaluated
         // per request so a late-bound port is seen. Host-controlled only:

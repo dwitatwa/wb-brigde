@@ -31,7 +31,7 @@ import { writeBridgeDescriptor, type BridgeDescriptor, type BridgeEndpoint } fro
 import { captureChannelFailure } from './failure-capture.ts'
 import { coalesceReasoning } from './coalesce.ts'
 import { probeMemberTurn, type MemberProbeOptions, type ChatProbeResult } from './account-probe.ts'
-import { WorkBuddyFailoverPool, type WorkBuddyPoolAttempt, type WorkBuddyPoolMemberHealth } from './pool.ts'
+import { WorkBuddyFailoverPool, type WorkBuddyPoolAttempt, type WorkBuddyPoolMember, type WorkBuddyPoolMemberHealth } from './pool.ts'
 import {
   attemptRecord,
   modelOfBody,
@@ -39,7 +39,8 @@ import {
   type WorkBuddyRequestAttempt,
   type WorkBuddyRequestRecord,
 } from './request-log.ts'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
+import { readFileSync } from 'node:fs'
 import {
   loadEndpointIdentities,
   portOfBaseUrl,
@@ -59,6 +60,11 @@ import {
   type CustomPoolMember,
   type CustomProviderPoolShim,
 } from './provider-pool.ts'
+import {
+  AccountStoreError,
+  WorkBuddyAccountStore,
+  type StoredAccount,
+} from './account-store.ts'
 import {
   ProviderManagementError,
   WorkBuddyManagedProviderStore,
@@ -112,6 +118,40 @@ const CATALOG_RETRY_SWEEPS = 10
 /** Stable identity key used by credentials and saved catalogs. */
 function credentialIdentity(credential: Pick<WorkBuddyCredential, 'uid' | 'enterpriseId'>): string {
   return `${credential.uid}:${credential.enterpriseId ?? ''}`
+}
+
+/**
+ * The account identity a stored file stands for: its basename, because the
+ * store names files by uid. Reading the file would need a decrypt, and the
+ * name is authoritative by construction.
+ */
+function uidOfStoredPath(path: string): string {
+  const name = basename(path)
+  return name.endsWith('.info') ? name.slice(0, -'.info'.length) : name
+}
+
+/**
+ * The account identity a discovered desktop file holds.
+ *
+ * The sweep already parsed these files to deduplicate them, but it returns
+ * paths only, so this re-reads the one plaintext field it needs. A file that
+ * cannot be read here contributes no identity and is therefore always added —
+ * the credential store is the authority on whether it is usable.
+ */
+function discoveredUidOf(path: string): string | undefined {
+  try {
+    const text = readFileSync(path, 'utf8')
+    const parsed: unknown = JSON.parse(text)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const document = parsed as Record<string, unknown>
+    const identity = typeof document['account'] === 'object' && document['account'] !== null
+      ? document['account'] as Record<string, unknown>
+      : document
+    const uid = identity['uid']
+    return typeof uid === 'string' && uid !== '' ? uid : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** The static roster a variant serves before its first successful fetch. */
@@ -188,6 +228,17 @@ interface VariantRuntime {
   accountIndex: number
   /** How many runtimes this variant serves; pool member labels use it. */
   accountTotal: number
+  /**
+   * The auth file this runtime was created for, or undefined when it reads the
+   * desktop app's default location.
+   *
+   * Kept so a rescan can tell which accounts are already served: the same file
+   * must not become a second member, and a member removed from the bridge must
+   * not come back merely because its file still exists.
+   */
+  authPath: string | undefined
+  /** Whether this runtime came from the bridge's own account folder. */
+  managedAccount: boolean
   /** The current credential's nickname, maintained by the sweep for labelling. */
   nickname: string | undefined
   /** The current credential's uid (email or user id), maintained by the sweep. */
@@ -235,6 +286,18 @@ export interface BridgeOptions {
    * never silently widened.
    */
   discoverAccounts?: boolean
+  /**
+   * Keep a bridge-owned account folder and expose it for management.
+   *
+   * The folder holds a copy of a desktop sign-in file per account, named by
+   * the account's uid. It exists so the operator can **remove** an account
+   * from the pool and keep an account **out** of rotation, neither of which is
+   * possible while the only source is the desktop app's own directory — the
+   * app owns those files, and `--all-accounts` sweeps everything it finds.
+   *
+   * Default false: an embedder that never manages accounts is unchanged.
+   */
+  manageAccounts?: boolean
   /**
    * Regroup the upstream's tiny reasoning deltas into larger chunks before
    * they reach the client. Default on: the upstream sends reasoning a word or
@@ -391,6 +454,8 @@ export class WorkBuddyBridge {
   private readonly options: BridgeOptions
   /** The managed-provider store; present only with `manageProviders: true`. */
   private managedStore: WorkBuddyManagedProviderStore | undefined
+  /** The bridge-owned account folder; present only with `manageAccounts: true`. */
+  private accountStore: WorkBuddyAccountStore | undefined
   /**
    * The pinned active snapshot: the managed document this bridge actually
    * serves. `listManagedProviders` answers from here, so the UI can never
@@ -483,6 +548,12 @@ export class WorkBuddyBridge {
       if (!parsed.ok) throw new Error(parsed.error)
       providers = parsed.config.providers
     }
+    // The bridge-owned account folder, when management is on. It is created
+    // lazily by the store itself, so an empty or absent folder is the normal
+    // first-run state rather than an error.
+    if (this.options.manageAccounts === true) {
+      this.accountStore = new WorkBuddyAccountStore()
+    }
     // Managed providers load before any listener starts, so a corrupt saved
     // document fails startup cleanly instead of half-serving. The loaded
     // transaction (metadata + captured keys, one revision) is pinned: the
@@ -550,18 +621,7 @@ export class WorkBuddyBridge {
       // are keyed by account identity, so one file (and one in-memory map)
       // holds every account's saved roster without them clobbering each
       // other on write.
-      const explicit = this.options.authFiles?.get(variant.id) ?? []
-      const discovered = explicit.length > 0
-        ? explicit
-        : this.options.discoverAccounts === true
-          ? discoverDesktopAuthFiles(variant).map(account => account.path)
-          : []
-      // No paths means the variant's ordinary single-account mode: one runtime
-      // that reads whatever the desktop app has signed in. `[undefined]` is
-      // that one entry — an empty array would start nothing at all, which is
-      // how the default (no flags) invocation once regressed to "no variant
-      // could start an endpoint".
-      const paths: ReadonlyArray<string | undefined> = discovered.length > 0 ? discovered : [undefined]
+      const { paths, managed } = await this.accountSourcesOf(variant)
       const savedCatalogs = new WorkBuddyCatalogStore(workbuddyCatalogPath(variant.catalogFilename))
       const total = paths.length
       for (const [index, path] of paths.entries()) {
@@ -575,6 +635,7 @@ export class WorkBuddyBridge {
           accountIndex: index + 1,
           accountTotal: total,
           savedCatalogs,
+          managedAccount: path !== undefined && managed.has(path),
         })
         if (runtime !== undefined) this.runtimes.push(runtime)
       }
@@ -834,9 +895,91 @@ export class WorkBuddyBridge {
     })
   }
 
+  /**
+   * The bridge-owned account folder's contents, for the page's account list.
+   *
+   * Metadata only: a stored file's tokens are never read here, let alone sent
+   * to a page with no authentication.
+   */
+  async listStoredAccounts(): Promise<StoredAccount[]> {
+    this.assertAccounts()
+    return await this.accountStore!.list()
+  }
+
+  /**
+   * Store one desktop sign-in file and serve it from the next request.
+   *
+   * The file is copied verbatim — this never re-seals a token — and an
+   * envelope sealed by a different WorkBuddy install is refused with the
+   * reason before anything is written. The account joins the pool immediately;
+   * the listener is not rebuilt, so the published URL and token are unchanged.
+   */
+  async importStoredAccount(input: { text: string; origin?: string }): Promise<StoredAccount> {
+    this.assertAccounts()
+    return await this.enqueueManagement(async () => {
+      const variant = this.accountVariant()
+      const account = await this.accountStore!.save({
+        text: input.text,
+        origin: input.origin ?? 'uploaded file',
+        // The key provider for the product the file will serve. A file for the
+        // other product is refused by the credential store later; the key
+        // check here is about this install, not about the region.
+        keyProvider: atRestKeyProviderFor(variant),
+      })
+      await this.rescanAccounts()
+      return account
+    })
+  }
+
+  /**
+   * Remove one stored account from the folder and from the pool.
+   *
+   * Only the bridge's own copy is deleted — the desktop app's file and its
+   * snapshots are untouched, so the account can be added back by copying the
+   * same file again. The pool's listener is unchanged; the member leaves the
+   * member list, and the head stays on the same account by identity.
+   */
+  async removeStoredAccount(uid: string): Promise<{ removed: boolean; total: number }> {
+    this.assertAccounts()
+    return await this.enqueueManagement(async () => {
+      const removed = await this.accountStore!.remove(uid)
+      if (!removed) return { removed: false, total: this.runtimes.length }
+      // Drop the runtime that was serving it, so the account stops answering
+      // at once rather than on the next restart.
+      for (const pool of this.pools) {
+        const index = pool.members.findIndex(runtime => runtime.managedAccount
+          && runtime.authPath !== undefined
+          && uidOfStoredPath(runtime.authPath) === uid)
+        if (index < 0) continue
+        const [runtime] = pool.members.splice(index, 1)
+        const runtimeIndex = this.runtimes.indexOf(runtime!)
+        if (runtimeIndex >= 0) this.runtimes.splice(runtimeIndex, 1)
+        // A pool needs at least one member; an empty one keeps the listener so
+        // the URL stays valid, and reports every member signed out.
+        if (pool.members.length > 0) pool.pool.setMembers(this.poolMembersOf(pool.members))
+      }
+      await this.syncAll()
+      await this.publishToDisk()
+      return { removed: true, total: this.runtimes.length }
+    })
+  }
+
+  /** The product a stored account file is assumed to belong to. */
+  private accountVariant(): WorkBuddyVariant {
+    const served = this.pools.map(pool => pool.variant)
+    return served.find(variant => variant.id !== CN_VARIANT.id) ?? served[0] ?? WORKBUDDY_VARIANTS[1]!
+  }
+
+  /** An account-management call on a bridge that does not manage accounts. */
+  private assertAccounts(): void {
+    if (this.stopped) throw new AccountStoreError(409, 'the bridge has stopped; account management is no longer available')
+    if (this.options.manageAccounts !== true || this.accountStore === undefined) {
+      throw new AccountStoreError(409, 'account management is not enabled on this bridge')
+    }
+  }
+
   /** Serialize management operations per bridge; cross-process stays on the file lock. */
-  private enqueueManagement<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.manageQueue.then(operation, operation)
+  private enqueueManagement<T>(operation: () => Promise<T>): Promise<T> {    const run = this.manageQueue.then(operation, operation)
     this.manageQueue = run.catch(() => {})
     return run
   }
@@ -931,6 +1074,167 @@ export class WorkBuddyBridge {
    * removed, or signed out, and failover appears the moment a second account
    * can answer.
    */
+  /** The live pool runtime for one product, when its endpoint is up. */
+  private poolRuntimeOf(variant: WorkBuddyVariant): PoolRuntime | undefined {
+    return this.pools.find(candidate => candidate.variant.id === variant.id)
+  }
+
+  /**
+   * The auth-file paths one variant should serve, and which of them belong to
+   * the bridge's own account folder.
+   *
+   * Order matters, because the first account keeps the historical
+   * plugin-owned credential copy. Bridge-owned accounts come first: they are
+   * the operator's explicit choices, and a stored copy of an account is more
+   * authoritative than a snapshot the desktop app happened to leave behind.
+   *
+   * Three sources, in precedence order:
+   *
+   * 1. Explicit `authFiles` for this variant — a hand-picked list replaces
+   *    everything else, exactly as before, so a caller that names its files is
+   *    never silently widened by a folder or a sweep.
+   * 2. The bridge's own account folder, when `manageAccounts` is on.
+   * 3. Desktop discovery, when `discoverAccounts` is on.
+   *
+   * Sources 2 and 3 are merged by account identity: a stored account and the
+   * desktop snapshot of the same sign-in are one member, not two, and the
+   * stored copy wins because the operator put it there.
+   *
+   * No paths at all means the variant's ordinary single-account mode — one
+   * runtime reading whatever the desktop app has signed in. `[undefined]` is
+   * that one entry; an empty array would start nothing, which is how the
+   * default invocation once regressed to "no variant could start an
+   * endpoint".
+   */
+  private async accountSourcesOf(variant: WorkBuddyVariant): Promise<{
+    paths: ReadonlyArray<string | undefined>
+    managed: ReadonlySet<string>
+  }> {
+    const explicit = this.options.authFiles?.get(variant.id) ?? []
+    if (explicit.length > 0) return { paths: explicit, managed: new Set() }
+
+    const stored = this.accountStore === undefined ? [] : await this.storedAccountPaths(variant)
+    const discovered = this.options.discoverAccounts === true
+      ? discoverDesktopAuthFiles(variant).map(account => account.path)
+      : []
+    if (stored.length === 0 && discovered.length === 0) return { paths: [undefined], managed: new Set() }
+
+    // Deduplicate by the identity the sweep itself uses. A stored file's
+    // identity is its basename (the store names files by uid); a discovered
+    // file's is the uid the sweep parsed. Reading the stored file again would
+    // cost a decrypt, so the basename is taken as the identity.
+    const seen = new Set(stored.map(uidOfStoredPath))
+    const merged = [...stored]
+    for (const path of discovered) {
+      const uid = discoveredUidOf(path)
+      if (uid !== undefined && seen.has(uid)) continue
+      if (uid !== undefined) seen.add(uid)
+      merged.push(path)
+    }
+    return { paths: merged, managed: new Set(stored) }
+  }
+
+  /**
+   * The stored account files for one product, in save order.
+   *
+   * The store is not per-variant on disk, so a file is offered to the variant
+   * whose region it belongs to. The store's own listing is metadata-only, and
+   * a region mismatch is caught later by the credential store — which is where
+   * it belongs, because only the parsed credential knows its domain.
+   */
+  private async storedAccountPaths(_variant: WorkBuddyVariant): Promise<string[]> {
+    if (this.accountStore === undefined) return []
+    try {
+      return await this.accountStore.paths()
+    } catch {
+      // An unreadable account folder must not stop the bridge: discovery and
+      // the desktop app's own file still serve.
+      return []
+    }
+  }
+
+  /**
+   * Add every account that appeared since the last scan, without a restart.
+   *
+   * This is the page's **Rescan** action. It repeats the source list — the
+   * bridge's own folder and the desktop sweep — and starts one runtime for
+   * each account not already served, then hands the pool the new member list.
+   * The listener is never rebuilt, so the published base URL and token are
+   * unchanged.
+   *
+   * A file already served is skipped by identity, so pressing the button twice
+   * adds nothing. Accounts that disappeared are **not** removed: a member whose
+   * file is gone keeps its runtime and simply reports as signed out, which is
+   * the same state a sign-out produces and keeps the head meaningful. Removing
+   * an account is an explicit action on the account folder.
+   *
+   * Returns what changed, for the caller to report.
+   */
+  async rescanAccounts(): Promise<{ added: string[]; total: number }> {
+    if (this.stopped) throw new UiRequestError(409, 'the bridge has stopped')
+    const added: string[] = []
+    for (const pool of this.pools) {
+      const variant = pool.variant
+      const { paths, managed } = await this.accountSourcesOf(variant)
+      const known = new Set(pool.members.map(runtime => runtime.authPath).filter((path): path is string => path !== undefined))
+      const savedCatalogs = new WorkBuddyCatalogStore(workbuddyCatalogPath(variant.catalogFilename))
+      for (const path of paths) {
+        if (path === undefined || known.has(path)) continue
+        const runtime = await this.startVariant(variant, {
+          ownPath: join(resolveBridgeHome(), `.workbuddy-auth-${this.runtimes.length + 1}.json`),
+          desktopPath: path,
+          accountIndex: pool.members.length + 1,
+          accountTotal: pool.members.length + 1,
+          savedCatalogs,
+          managedAccount: managed.has(path),
+        })
+        if (runtime === undefined) continue
+        this.runtimes.push(runtime)
+        pool.members.push(runtime)
+        known.add(path)
+        added.push(path)
+      }
+      if (added.length > 0) {
+        // One membership update per pool: the router re-anchors the head by
+        // identity, so live traffic stays on the account that was serving it.
+        pool.pool.setMembers(this.poolMembersOf(pool.members))
+      }
+    }
+    if (added.length > 0) {
+      await this.syncAll()
+      await this.publishToDisk()
+    }
+    return {
+      added: added.map(path => basename(path)),
+      total: this.runtimes.length,
+    }
+  }
+
+  /** The live pool runtime for one product, when its endpoint is up. */
+
+  /**
+   * The pool members one variant's runtimes produce, in runtime order.
+   *
+   * `id` is the runtime's stable identity so the router can keep the head on
+   * the same account when the member list changes. A runtime that has not
+   * resolved a credential yet has no uid, so it is identified by its auth path
+   * — still stable, still unique — and falls back to its position only when it
+   * has neither.
+   */
+  private poolMembersOf(members: readonly VariantRuntime[]): WorkBuddyPoolMember[] {
+    return members.map((runtime, index) => ({
+      id: runtime.uid ?? runtime.authPath ?? `#${index}`,
+      // The wrapped chat turn — capture and reasoning transform included — so
+      // a pool-served refusal is diagnosable the same way a direct one was,
+      // and a probe exercises the same path.
+      store: runtime.store,
+      client: {
+        chatStream: (credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal) =>
+          runtime.chat(credential, bodyJson, signal),
+      },
+    }))
+  }
+
   private async startPools(variants: readonly WorkBuddyVariant[]): Promise<void> {
     const logger = this.options.logger
     for (const variant of variants) {
@@ -939,16 +1243,7 @@ export class WorkBuddyBridge {
       const catalog = new WorkBuddyCatalog(fallbackFor(variant))
       if (variant.id !== CN_VARIANT.id) catalog.setUseMaximumContextWindow(true)
       catalog.setVisible(false)
-      const pool = new WorkBuddyFailoverPool(members.map(runtime => ({
-        // The wrapped chat turn — capture and reasoning transform included —
-        // so a pool-served refusal is diagnosable the same way a direct one
-        // was, and a probe exercises the same path.
-        store: runtime.store,
-        client: {
-          chatStream: (credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal) =>
-            runtime.chat(credential, bodyJson, signal),
-        },
-      })))
+      const pool = new WorkBuddyFailoverPool(this.poolMembersOf(members))
       // The shim's option types name the concrete store class, but it only
       // ever calls `store.resolve()`; the pool implements that contract.
       //
@@ -961,9 +1256,14 @@ export class WorkBuddyBridge {
           chatStream: async (credential, bodyJson, signal) => {
             const startedAtMs = Date.now()
             const attempts: WorkBuddyRequestAttempt[] = []
+            // The attempt indices refer to the pool's current member list, so
+            // the labels are read from it rather than from the list captured
+            // when this listener started: an account added since then is a
+            // real member and must be named, not shown as a bare index.
+            const current = this.poolRuntimeOf(variant)
             const result = await pool.chatStream(credential, bodyJson, signal, attempt => {
               attempts.push(attemptRecord(attempt, index => {
-                const member = members[index]
+                const member = current?.members[index]
                 return member?.nickname ?? `account ${member?.accountIndex ?? index + 1}`
               }))
             })
@@ -1339,6 +1639,7 @@ export class WorkBuddyBridge {
       accountIndex: number
       accountTotal: number
       savedCatalogs: WorkBuddyCatalogStore
+      managedAccount?: boolean
     },
   ): Promise<VariantRuntime | undefined> {
     const client = new WorkBuddyUpstreamClient()
@@ -1381,6 +1682,8 @@ export class WorkBuddyBridge {
       inflight: undefined,
       accountIndex: account.accountIndex,
       accountTotal: account.accountTotal,
+      authPath: account.desktopPath,
+      managedAccount: account.managedAccount === true,
       nickname: undefined,
       uid: undefined,
     }

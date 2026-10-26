@@ -22,6 +22,21 @@ restarts, so a client configured once keeps working; pass
 `--no-stable-endpoints` for a fresh pair on every start.
 `workbuddy-bridge models`, `status`, and `env` read the running descriptor.
 
+## Add a WorkBuddy account
+
+Sign in to the account in the WorkBuddy desktop app, then press **Rescan
+accounts** in the web UI. The account joins the pool at once. The pool's base
+URL and token do not change, so your client configuration stays correct.
+
+The **Accounts** button opens a folder the bridge owns, one sign-in copy per
+account. Add a file there to keep an account, or remove one to take it out of
+the pool. Removing deletes only the bridge's copy; the WorkBuddy app's own
+files are never touched.
+
+A file sealed by a different WorkBuddy install cannot be read on this computer,
+because the encryption key is local to the install. Import checks this and
+refuses such a file with the reason.
+
 ## Add a provider in the existing UI
 
 Start the bridge with the web UI and open the page (`workbuddy-bridge ui`, or

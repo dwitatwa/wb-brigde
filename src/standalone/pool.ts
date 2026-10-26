@@ -13,6 +13,12 @@
  * keeps the head where it is, so a healthy account does not have its
  * requests scattered across the pool.
  *
+ * **Membership is editable while running.** An account added from the page
+ * joins the pool without a restart, so the head is tracked by the member's
+ * identity rather than by position: appending or removing an account must not
+ * silently redirect live traffic to a different one. Members that name no
+ * identity keep the historical position-based behaviour.
+ *
  * Requests are stateless per turn upstream — each carries a fresh
  * conversation-header family — so two consecutive turns of one conversation
  * may legitimately be served by different accounts. That is the trade the
@@ -30,6 +36,15 @@ import type { WorkBuddyUpstreamClient, UpstreamErrorKind, WorkBuddyChatResult } 
  * can stand in stubs; the real bridge passes each account runtime's pieces.
  */
 export interface WorkBuddyPoolMember {
+  /**
+   * A stable label for this member, used to keep the head on the same account
+   * when the member list changes. Absent means the member is addressed by
+   * position, which is what every pre-existing caller does.
+   *
+   * Must be unique among the members of one pool and must not change for the
+   * life of the member; the account's uid is the natural choice.
+   */
+  id?: string
   /** Resolves this member's credential, refreshing it when due. */
   store: Pick<import('../core/auth.ts').WorkBuddyCredentialStore, 'resolve'>
   /** Sends this member's chat turn upstream. */
@@ -108,22 +123,82 @@ function messageOf(error: unknown): string {
  * credential when any member has one, so a pool where every account is
  * signed out still produces the shim's 401 rather than a confused 500. The
  * real per-attempt credential resolution happens inside {@link chatStream}.
+ *
+ * The member list is replaceable through {@link setMembers}, which is what
+ * lets an account added from the page serve from the next request without the
+ * listener being rebuilt. The head survives that call: it is stored as an
+ * identity when members name one, so appending an account cannot move live
+ * traffic onto it.
  */
 export class WorkBuddyFailoverPool {
   /** Where the next request starts; advances past failed members. */
   private head = 0
+  /** The identity the head belongs to, when the members name one. */
+  private headId: string | undefined
+  private members: readonly WorkBuddyPoolMember[]
   /** Per-member traffic record, parallel to `members`. */
-  private readonly observed: WorkBuddyPoolMemberHealth[]
+  private observed: WorkBuddyPoolMemberHealth[]
 
-  constructor(private readonly members: readonly WorkBuddyPoolMember[]) {
+  constructor(members: readonly WorkBuddyPoolMember[]) {
     if (members.length === 0) throw new Error('a failover pool needs at least one account')
-    this.observed = members.map((_member, index) => ({
+    this.members = members
+    this.observed = WorkBuddyFailoverPool.freshRecords(members.length)
+  }
+
+  /** One all-zero traffic record per member. */
+  private static freshRecords(count: number): WorkBuddyPoolMemberHealth[] {
+    return Array.from({ length: count }, (_unused, index) => ({
       index,
       lastAttemptAtMs: 0,
       consecutiveFailures: 0,
       successes: 0,
       failures: 0,
     }))
+  }
+
+  /**
+   * Replace the member list, keeping the head on the same account.
+   *
+   * Traffic records follow a member's identity when it has one, so an account
+   * that has already served keeps its success and failure counts across an
+   * edit. A member with no identity is matched by position, which is the
+   * behaviour every caller had before membership could change.
+   *
+   * An empty list is refused: a pool with no members has nothing to serve and
+   * would turn every request into an unexplained 500. Callers retire the
+   * endpoint instead.
+   */
+  setMembers(members: readonly WorkBuddyPoolMember[]): void {
+    if (members.length === 0) throw new Error('a failover pool needs at least one account')
+    const previous = this.members
+    const carried = new Map<string, WorkBuddyPoolMemberHealth>()
+    for (const [index, member] of previous.entries()) {
+      const record = this.observed[index]
+      if (record === undefined) continue
+      const id = member.id ?? `#${index}`
+      carried.set(id, record)
+    }
+    this.members = members
+    this.observed = members.map((member, index) => {
+      const record = carried.get(member.id ?? `#${index}`)
+      return {
+        index,
+        lastAttemptAtMs: record?.lastAttemptAtMs ?? 0,
+        ...record?.lastOutcome === undefined ? {} : { lastOutcome: record.lastOutcome },
+        consecutiveFailures: record?.consecutiveFailures ?? 0,
+        successes: record?.successes ?? 0,
+        failures: record?.failures ?? 0,
+      }
+    })
+    // Re-anchor the head: by identity when the old head named one, otherwise
+    // by position clamped to the new length.
+    if (this.headId !== undefined) {
+      const index = members.findIndex(member => member.id === this.headId)
+      this.head = index < 0 ? 0 : index
+      if (index < 0) this.headId = undefined
+      return
+    }
+    this.head = Math.min(this.head, members.length - 1)
   }
 
   /** How many accounts the pool can draw from. */
@@ -163,6 +238,12 @@ export class WorkBuddyFailoverPool {
    * because the whole point is that the answering account is chosen by the
    * failure pattern, not by whoever happened to be head when the request
    * arrived. Returns the first success; otherwise the last failure seen.
+   *
+   * The member list is read once into a local, so a membership change mid-turn
+   * cannot make one request see two different pools. The head start and the
+   * traffic records are captured with it for the same reason: `setMembers`
+   * replaces all three, and a turn that began before the change must finish
+   * against the pool it started on.
    */
   async chatStream(
     _credential: WorkBuddyCredential,
@@ -170,31 +251,39 @@ export class WorkBuddyFailoverPool {
     signal?: AbortSignal,
     onAttempt?: (attempt: WorkBuddyPoolAttempt) => void,
   ): Promise<WorkBuddyChatResult> {
+    const members = this.members
+    const observed = this.observed
+    const start = this.head
     let last: WorkBuddyChatResult | undefined
-    for (let offset = 0; offset < this.members.length; offset += 1) {
+    for (let offset = 0; offset < members.length; offset += 1) {
       // A caller that hung up mid-failover must not burn through the rest of
       // the pool on a request nobody is waiting for any more.
       if (signal?.aborted === true) {
         return last ?? { ok: false, status: 0, kind: 'server', message: 'transport error: request aborted before an account could answer' }
       }
-      const index = (this.head + offset) % this.members.length
-      const member = this.members[index]!
+      const index = (start + offset) % members.length
+      const member = members[index]!
       let credential: WorkBuddyCredential
       try {
         credential = await member.store.resolve()
       } catch (error: unknown) {
         const outcome: WorkBuddyPoolAttempt['outcome'] = { state: 'credential-error', message: messageOf(error) }
         last = { ok: false, status: 401, kind: 'session_dead', message: messageOf(error) }
-        this.note(index, outcome)
+        note(observed, index, outcome)
         onAttempt?.({ index, outcome })
         continue
       }
       const result = await member.client.chatStream(credential, bodyJson, signal)
       if (result.ok) {
-        // Stick: a healthy member keeps serving until it fails.
-        this.head = index
+        // Stick: a healthy member keeps serving until it fails. Only the live
+        // pool is re-anchored — a turn that outlived a membership change must
+        // not move the head of a list it no longer describes.
+        if (this.members === members) {
+          this.head = index
+          this.headId = member.id
+        }
         const outcome: WorkBuddyPoolAttempt['outcome'] = { state: 'ok' }
-        this.note(index, outcome)
+        note(observed, index, outcome)
         onAttempt?.({ index, outcome })
         return result
       }
@@ -205,32 +294,42 @@ export class WorkBuddyFailoverPool {
         kind: result.kind,
         message: result.message,
       }
-      this.note(index, outcome)
+      note(observed, index, outcome)
       onAttempt?.({ index, outcome })
       if (!POOL_FAILOVER_KINDS.has(result.kind)) return result
     }
     return last ?? { ok: false, status: 0, kind: 'server', message: 'the account pool is empty' }
   }
 
-  /**
-   * Fold one attempt into that member's record.
-   *
-   * Recorded by the router itself rather than by the caller's `onAttempt`
-   * hook, because the UI reads it whether or not anybody is listening to the
-   * hook — and a record that only exists when a diagnostic is attached would
-   * be empty exactly when an operator first opens the page.
-   */
-  private note(index: number, outcome: WorkBuddyPoolAttempt['outcome']): void {
-    const entry = this.observed[index]
-    if (entry === undefined) return
-    entry.lastAttemptAtMs = Date.now()
-    entry.lastOutcome = outcome
-    if (outcome.state === 'ok') {
-      entry.successes += 1
-      entry.consecutiveFailures = 0
-      return
-    }
-    entry.failures += 1
-    entry.consecutiveFailures += 1
+}
+
+/**
+ * Fold one attempt into that member's record.
+ *
+ * Recorded by the router itself rather than by the caller's `onAttempt`
+ * hook, because the UI reads it whether or not anybody is listening to the
+ * hook — and a record that only exists when a diagnostic is attached would
+ * be empty exactly when an operator first opens the page.
+ *
+ * Takes the record array rather than reading `this`, so a turn that began
+ * before a membership change writes to the records of the pool it started
+ * on. `setMembers` carries those records forward by identity, so the write is
+ * not lost when the turn outlives the change.
+ */
+function note(
+  observed: WorkBuddyPoolMemberHealth[],
+  index: number,
+  outcome: WorkBuddyPoolAttempt['outcome'],
+): void {
+  const entry = observed[index]
+  if (entry === undefined) return
+  entry.lastAttemptAtMs = Date.now()
+  entry.lastOutcome = outcome
+  if (outcome.state === 'ok') {
+    entry.successes += 1
+    entry.consecutiveFailures = 0
+    return
   }
+  entry.failures += 1
+  entry.consecutiveFailures += 1
 }

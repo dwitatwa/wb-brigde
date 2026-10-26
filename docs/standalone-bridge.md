@@ -549,6 +549,7 @@ code.
 | `--auth-file <path>` | explicit WorkBuddy (CN) desktop auth file; **repeatable** — each occurrence adds one account |
 | `--auth-file-ai <path>` | explicit WorkBuddy AI desktop auth file; **repeatable** — each occurrence adds one account |
 | `--all-accounts` | serve every account found in the desktop auth directory; explicit flags win for the product they name |
+| `--no-accounts-ui` | do not keep or expose the bridge-owned account folder (see [The bridge-owned account folder](#the-bridge-owned-account-folder)) |
 | `--home <dir>` | override the bridge home |
 | `--no-descriptor` | do not write the descriptor file |
 | `--redact-token` | write the descriptor without the bearer token |
@@ -583,6 +584,21 @@ identity file.
 
 One process can serve several accounts of the same product — listed
 explicitly, or discovered automatically.
+
+**Adding an account while the bridge runs.** The **Rescan accounts** button on
+the page repeats the account sources and starts one runtime for each account
+that is not served yet. The listener is never rebuilt, so the published base
+URL and token stay the same and a client configured once keeps working. Sign in
+to the new account in the desktop app, then press **Rescan accounts** — no
+restart.
+
+The **Accounts** button opens the bridge's own account folder (see
+[The bridge-owned account folder](#the-bridge-owned-account-folder)). There you
+can add a sign-in file and remove a stored account.
+
+A rescan never *removes* a member: an account whose file is gone keeps its
+runtime and reports as signed out, the same state a sign-out produces. Use
+**Accounts → Remove** to take an account out of the pool.
 
 **Discovery (recommended).** The desktop app's atomic writes leave one
 snapshot per sign-in behind in its auth directory, so a machine that has used
@@ -624,6 +640,49 @@ app once and copying `workbuddy-desktop.info` aside. Notes:
   other. Saved model catalogs are shared per product and keyed by account
   identity, which is how the store already distinguished accounts.
 - The web UI shows each account's credits on its own row in the pool table.
+
+### The bridge-owned account folder
+
+The desktop auth directory belongs to the WorkBuddy app: the app writes it,
+rewrites it, and leaves a snapshot behind on every sign-in. The bridge may read
+it, but it must not delete from it, and it cannot keep an account out of
+rotation while `--all-accounts` sweeps everything. A folder the bridge owns
+answers both.
+
+It lives at `~/.workbuddy-bridge/accounts/`, one file per account named by the
+account's uid, `0600` inside a `0700` directory (with the Windows ACL pass where
+mode bits cannot apply). Each file is a **verbatim copy** of a desktop sign-in
+document — the bridge never re-seals a token — with a sidecar `.json` holding
+only the origin and the save time.
+
+**Precedence.** Three sources, in order:
+
+1. Explicit `--auth-file*` flags — a hand-picked list replaces everything else,
+   so a rescan never widens it.
+2. The bridge's own account folder.
+3. Desktop discovery (`--all-accounts`).
+
+Sources 2 and 3 are merged by account identity, so a stored copy and the
+desktop snapshot of the same sign-in are one member, not two.
+
+**Add.** **Accounts → Add file** accepts a `workbuddy-desktop-ai*.info` file
+from this computer. The account joins the pool immediately.
+
+**Remove.** **Accounts → Remove** deletes the bridge's own copy and drops the
+account from the pool. The desktop app's file and its snapshots are never
+touched, so the account can be added back by copying the same file again.
+
+**A file sealed by another install cannot be read here.** Since WorkBuddy 5.6
+the tokens are encrypted with a key that lives in the local app's Electron
+binary, and the envelope records the key id it was sealed with. Import checks
+that id before writing anything, so a file from a different computer is refused
+with the reason instead of becoming a member that fails on every turn. A
+plaintext file from a pre-5.6 install carries no key id and is accepted.
+
+**Every route is gated like provider management**: loopback `Host`, an exact
+`Origin` match, the per-process nonce in `X-Bridge-Ui`, and
+`application/json`. These routes write and delete credential files, so they are
+never reachable from a merely-loopback page.
 
 ### The failover pool
 

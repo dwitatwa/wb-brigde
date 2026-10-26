@@ -237,6 +237,51 @@ type ParseResult = {
 /** Parse and validate an already-read config value (an object from JSON). */
 declare function parseProviderConfig(input: unknown): ParseResult;
 //#endregion
+//#region src/standalone/account-store.d.ts
+/** One stored account, as the UI lists it. Metadata only — never a token. */
+interface StoredAccount {
+  /** The account identity, which is also the file's basename. */
+  uid: string;
+  /** The desktop file this copy came from, for the operator's benefit. */
+  origin: string;
+  /** When the copy was written. */
+  savedAtMs: number;
+  /** Whether the stored document is a 5.6 at-rest envelope. */
+  encrypted: boolean;
+}
+/**
+ * What the page can do with WorkBuddy accounts.
+ *
+ * Deliberately narrow: **list**, **import** one desktop sign-in file, **remove**
+ * one stored account, and **rescan** the sources for accounts that appeared
+ * since the bridge started. There is no "edit" — a sign-in file is a credential
+ * blob, and changing it is not a page operation. There is also no way to reach
+ * the desktop app's own directory: this surface only ever touches the bridge's
+ * copy.
+ */
+interface AccountManagement {
+  /** The stored accounts, metadata only. */
+  list(): Promise<readonly StoredAccount[]>;
+  /**
+   * Store one sign-in file and serve it from the next request. `text` is the
+   * file's own bytes; the manager validates and refuses a foreign envelope.
+   */
+  import(input: {
+    text: string;
+    origin?: string;
+  }): Promise<StoredAccount>;
+  /** Remove one stored account; `removed: false` when it was not there. */
+  remove(uid: string): Promise<{
+    removed: boolean;
+    total: number;
+  }>;
+  /** Pick up accounts that appeared since the last scan. */
+  rescan(): Promise<{
+    added: readonly string[];
+    total: number;
+  }>;
+}
+//#endregion
 //#region src/standalone/provider-store.d.ts
 /**
  * The UI-managed provider store: file-backed CRUD for custom
@@ -410,6 +455,15 @@ declare class WorkBuddyManagedProviderStore implements ProviderManagement {
  * can stand in stubs; the real bridge passes each account runtime's pieces.
  */
 interface WorkBuddyPoolMember {
+  /**
+   * A stable label for this member, used to keep the head on the same account
+   * when the member list changes. Absent means the member is addressed by
+   * position, which is what every pre-existing caller does.
+   *
+   * Must be unique among the members of one pool and must not change for the
+   * life of the member; the account's uid is the natural choice.
+   */
+  id?: string;
   /** Resolves this member's credential, refreshing it when due. */
   store: Pick<WorkBuddyCredentialStore, 'resolve'>;
   /** Sends this member's chat turn upstream. */
@@ -481,14 +535,37 @@ interface WorkBuddyPoolMemberHealth {
  * credential when any member has one, so a pool where every account is
  * signed out still produces the shim's 401 rather than a confused 500. The
  * real per-attempt credential resolution happens inside {@link chatStream}.
+ *
+ * The member list is replaceable through {@link setMembers}, which is what
+ * lets an account added from the page serve from the next request without the
+ * listener being rebuilt. The head survives that call: it is stored as an
+ * identity when members name one, so appending an account cannot move live
+ * traffic onto it.
  */
 declare class WorkBuddyFailoverPool {
-  private readonly members;
   /** Where the next request starts; advances past failed members. */
   private head;
+  /** The identity the head belongs to, when the members name one. */
+  private headId;
+  private members;
   /** Per-member traffic record, parallel to `members`. */
-  private readonly observed;
+  private observed;
   constructor(members: readonly WorkBuddyPoolMember[]);
+  /** One all-zero traffic record per member. */
+  private static freshRecords;
+  /**
+   * Replace the member list, keeping the head on the same account.
+   *
+   * Traffic records follow a member's identity when it has one, so an account
+   * that has already served keeps its success and failure counts across an
+   * edit. A member with no identity is matched by position, which is the
+   * behaviour every caller had before membership could change.
+   *
+   * An empty list is refused: a pool with no members has nothing to serve and
+   * would turn every request into an unexplained 500. Callers retire the
+   * endpoint instead.
+   */
+  setMembers(members: readonly WorkBuddyPoolMember[]): void;
   /** How many accounts the pool can draw from. */
   get size(): number;
   /** The member that will answer the next request, 0-based. */
@@ -505,17 +582,14 @@ declare class WorkBuddyFailoverPool {
    * because the whole point is that the answering account is chosen by the
    * failure pattern, not by whoever happened to be head when the request
    * arrived. Returns the first success; otherwise the last failure seen.
+   *
+   * The member list is read once into a local, so a membership change mid-turn
+   * cannot make one request see two different pools. The head start and the
+   * traffic records are captured with it for the same reason: `setMembers`
+   * replaces all three, and a turn that began before the change must finish
+   * against the pool it started on.
    */
   chatStream(_credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal, onAttempt?: (attempt: WorkBuddyPoolAttempt) => void): Promise<WorkBuddyChatResult>;
-  /**
-   * Fold one attempt into that member's record.
-   *
-   * Recorded by the router itself rather than by the caller's `onAttempt`
-   * hook, because the UI reads it whether or not anybody is listening to the
-   * hook — and a record that only exists when a diagnostic is attached would
-   * be empty exactly when an operator first opens the page.
-   */
-  private note;
 }
 //#endregion
 //#region src/standalone/request-log.d.ts
@@ -802,6 +876,14 @@ interface WorkBuddyUiOptions {
    */
   providers?: ProviderManagement;
   /**
+   * WorkBuddy account management: the bridge-owned account folder, plus a
+   * rescan that picks up an account signed in since the bridge started.
+   *
+   * Absent means the page shows no account controls at all — an embedder that
+   * does not manage accounts keeps the read-only UI it had.
+   */
+  accounts?: AccountManagement;
+  /**
    * Exact extra origins the UI is served from, e.g. the WSL forwarder's URL
    * when the bridge was started with `--wsl`. Called per request so a
    * late-bound forwarder port is seen.
@@ -880,6 +962,18 @@ interface BridgeOptions {
    */
   discoverAccounts?: boolean;
   /**
+   * Keep a bridge-owned account folder and expose it for management.
+   *
+   * The folder holds a copy of a desktop sign-in file per account, named by
+   * the account's uid. It exists so the operator can **remove** an account
+   * from the pool and keep an account **out** of rotation, neither of which is
+   * possible while the only source is the desktop app's own directory — the
+   * app owns those files, and `--all-accounts` sweeps everything it finds.
+   *
+   * Default false: an embedder that never manages accounts is unchanged.
+   */
+  manageAccounts?: boolean;
+  /**
    * Regroup the upstream's tiny reasoning deltas into larger chunks before
    * they reach the client. Default on: the upstream sends reasoning a word or
    * two at a time, and a client that starts a new thinking block per closed
@@ -932,6 +1026,8 @@ declare class WorkBuddyBridge {
   private readonly options;
   /** The managed-provider store; present only with `manageProviders: true`. */
   private managedStore;
+  /** The bridge-owned account folder; present only with `manageAccounts: true`. */
+  private accountStore;
   /**
    * The pinned active snapshot: the managed document this bridge actually
    * serves. `listManagedProviders` answers from here, so the UI can never
@@ -1080,6 +1176,41 @@ declare class WorkBuddyBridge {
    * commit, matching save's dual guard.
    */
   removeManagedProvider(input: unknown): Promise<ManagedProviderSnapshot>;
+  /**
+   * The bridge-owned account folder's contents, for the page's account list.
+   *
+   * Metadata only: a stored file's tokens are never read here, let alone sent
+   * to a page with no authentication.
+   */
+  listStoredAccounts(): Promise<StoredAccount[]>;
+  /**
+   * Store one desktop sign-in file and serve it from the next request.
+   *
+   * The file is copied verbatim — this never re-seals a token — and an
+   * envelope sealed by a different WorkBuddy install is refused with the
+   * reason before anything is written. The account joins the pool immediately;
+   * the listener is not rebuilt, so the published URL and token are unchanged.
+   */
+  importStoredAccount(input: {
+    text: string;
+    origin?: string;
+  }): Promise<StoredAccount>;
+  /**
+   * Remove one stored account from the folder and from the pool.
+   *
+   * Only the bridge's own copy is deleted — the desktop app's file and its
+   * snapshots are untouched, so the account can be added back by copying the
+   * same file again. The pool's listener is unchanged; the member leaves the
+   * member list, and the head stays on the same account by identity.
+   */
+  removeStoredAccount(uid: string): Promise<{
+    removed: boolean;
+    total: number;
+  }>;
+  /** The product a stored account file is assumed to belong to. */
+  private accountVariant;
+  /** An account-management call on a bridge that does not manage accounts. */
+  private assertAccounts;
   /** Serialize management operations per bridge; cross-process stays on the file lock. */
   private enqueueManagement;
   /** A bridge not started with `manageProviders` has no management surface. */
@@ -1114,6 +1245,77 @@ declare class WorkBuddyBridge {
    * removed, or signed out, and failover appears the moment a second account
    * can answer.
    */
+  /** The live pool runtime for one product, when its endpoint is up. */
+  private poolRuntimeOf;
+  /**
+   * The auth-file paths one variant should serve, and which of them belong to
+   * the bridge's own account folder.
+   *
+   * Order matters, because the first account keeps the historical
+   * plugin-owned credential copy. Bridge-owned accounts come first: they are
+   * the operator's explicit choices, and a stored copy of an account is more
+   * authoritative than a snapshot the desktop app happened to leave behind.
+   *
+   * Three sources, in precedence order:
+   *
+   * 1. Explicit `authFiles` for this variant — a hand-picked list replaces
+   *    everything else, exactly as before, so a caller that names its files is
+   *    never silently widened by a folder or a sweep.
+   * 2. The bridge's own account folder, when `manageAccounts` is on.
+   * 3. Desktop discovery, when `discoverAccounts` is on.
+   *
+   * Sources 2 and 3 are merged by account identity: a stored account and the
+   * desktop snapshot of the same sign-in are one member, not two, and the
+   * stored copy wins because the operator put it there.
+   *
+   * No paths at all means the variant's ordinary single-account mode — one
+   * runtime reading whatever the desktop app has signed in. `[undefined]` is
+   * that one entry; an empty array would start nothing, which is how the
+   * default invocation once regressed to "no variant could start an
+   * endpoint".
+   */
+  private accountSourcesOf;
+  /**
+   * The stored account files for one product, in save order.
+   *
+   * The store is not per-variant on disk, so a file is offered to the variant
+   * whose region it belongs to. The store's own listing is metadata-only, and
+   * a region mismatch is caught later by the credential store — which is where
+   * it belongs, because only the parsed credential knows its domain.
+   */
+  private storedAccountPaths;
+  /**
+   * Add every account that appeared since the last scan, without a restart.
+   *
+   * This is the page's **Rescan** action. It repeats the source list — the
+   * bridge's own folder and the desktop sweep — and starts one runtime for
+   * each account not already served, then hands the pool the new member list.
+   * The listener is never rebuilt, so the published base URL and token are
+   * unchanged.
+   *
+   * A file already served is skipped by identity, so pressing the button twice
+   * adds nothing. Accounts that disappeared are **not** removed: a member whose
+   * file is gone keeps its runtime and simply reports as signed out, which is
+   * the same state a sign-out produces and keeps the head meaningful. Removing
+   * an account is an explicit action on the account folder.
+   *
+   * Returns what changed, for the caller to report.
+   */
+  rescanAccounts(): Promise<{
+    added: string[];
+    total: number;
+  }>;
+  /** The live pool runtime for one product, when its endpoint is up. */
+  /**
+   * The pool members one variant's runtimes produce, in runtime order.
+   *
+   * `id` is the runtime's stable identity so the router can keep the head on
+   * the same account when the member list changes. A runtime that has not
+   * resolved a credential yet has no uid, so it is identified by its auth path
+   * — still stable, still unique — and falls back to its position only when it
+   * has neither.
+   */
+  private poolMembersOf;
   private startPools;
   /** The descriptor as of the last publish. */
   publish(): Promise<BridgeDescriptor>;

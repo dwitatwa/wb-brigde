@@ -35,6 +35,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { listenOnPreferredPort } from '../core/listen.ts'
 import { hostIsLoopback, originIsLoopback } from '../core/loopback.ts'
 import type { ShimLogger } from '../core/shim.ts'
+import { AccountStoreError, type AccountManagement } from './account-store.ts'
 import { ProviderManagementError, type ProviderManagement } from './provider-store.ts'
 import type { WorkBuddyRequestRecord } from './request-log.ts'
 
@@ -254,6 +255,15 @@ export type {
 export { ProviderManagementError } from './provider-store.ts'
 
 /**
+ * The account-management contract, re-exported from the store module for the
+ * same reason as the provider one: the UI's surface stays self-contained, and
+ * `AccountStoreError` is matched by `instanceof` so a look-alike error can
+ * never carry its message to a page with no authentication.
+ */
+export type { AccountManagement, StoredAccount } from './account-store.ts'
+export { AccountStoreError } from './account-store.ts'
+
+/**
  * A running UI server.
  */
 export interface WorkBuddyUiServer {
@@ -283,6 +293,14 @@ export interface WorkBuddyUiOptions {
    * embedder that hands out a fixed configuration keeps its read-only UI.
    */
   providers?: ProviderManagement
+  /**
+   * WorkBuddy account management: the bridge-owned account folder, plus a
+   * rescan that picks up an account signed in since the bridge started.
+   *
+   * Absent means the page shows no account controls at all — an embedder that
+   * does not manage accounts keeps the read-only UI it had.
+   */
+  accounts?: AccountManagement
   /**
    * Exact extra origins the UI is served from, e.g. the WSL forwarder's URL
    * when the bridge was started with `--wsl`. Called per request so a
@@ -419,6 +437,15 @@ const PROBE_BODY_LIMIT = 8 * 1024
 /** Largest management body accepted; a provider description with model list. */
 const MANAGEMENT_BODY_LIMIT = 64 * 1024
 
+/**
+ * Largest account body accepted; one sign-in file, which is a few kilobytes.
+ *
+ * Larger than a probe body because the file is carried whole, but far below
+ * the management limit: an auth document has no reason to approach this, and
+ * an oversized one is refused rather than buffered.
+ */
+const ACCOUNT_BODY_LIMIT = 128 * 1024
+
 /** Header the page repeats the nonce in. Custom, so it forces a preflight. */
 const PROBE_HEADER = 'x-bridge-ui'
 
@@ -530,13 +557,72 @@ function parseRemoveBody(raw: string): { revision: string, id: string } {
 }
 
 /**
+ * The account routes, as one set so the gate and the error handling cannot
+ * drift apart: every one of them is management, and every one of them needs
+ * the nonce.
+ */
+const ACCOUNT_ROUTES: ReadonlySet<string> = new Set([
+  '/api/accounts/rescan',
+  '/api/accounts/import',
+  '/api/accounts/remove',
+])
+
+/**
+ * Validate an import body: the file's text plus an optional origin label.
+ *
+ * The text is the file's own bytes and is deliberately not parsed here — the
+ * store classifies it, and a parse failure at this layer would duplicate rules
+ * the store already owns. Only the envelope's shape is checked, so a missing
+ * `text` never reaches the store as `undefined`.
+ */
+function parseAccountImportBody(raw: string): { text: string, origin?: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new UiRequestError(400, 'body must be JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new UiRequestError(400, 'body must be a JSON object')
+  }
+  const record = parsed as Record<string, unknown>
+  const text = record['text']
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new UiRequestError(400, 'text must be the sign-in file\'s contents')
+  }
+  const origin = record['origin']
+  if (origin !== undefined && typeof origin !== 'string') {
+    throw new UiRequestError(400, 'origin must be a string when present')
+  }
+  return { text, ...origin === undefined || origin === '' ? {} : { origin: origin.slice(0, 200) } }
+}
+
+/** Validate a remove body: the account uid. */
+function parseAccountRemoveBody(raw: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new UiRequestError(400, 'body must be JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new UiRequestError(400, 'body must be a JSON object')
+  }
+  const uid = (parsed as Record<string, unknown>)['uid']
+  if (typeof uid !== 'string' || uid === '') {
+    throw new UiRequestError(400, 'uid must be a non-empty string')
+  }
+  return uid
+}
+
+/**
  * Start the UI server.
  *
  * Returns `ready` rather than awaiting the listen, so a caller can hold the
  * handle before the port is known — the same shape the shim exposes.
  */
 export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyUiServer {
-  const { state, probe, providers, allowedUiOrigins, logger } = options
+  const { state, probe, providers, accounts, allowedUiOrigins, logger } = options
   // Minted per process, not per page: the page is re-served on every load, and
   // a token that changed under a reload would make an open tab's test buttons
   // fail for no reason the user could see.
@@ -544,6 +630,7 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
   const page = PAGE
     .replace('"__UI_NONCE__"', JSON.stringify(nonce))
     .replace('"__MANAGE__"', JSON.stringify(providers !== undefined))
+    .replace('"__MANAGE_ACCOUNTS__"', JSON.stringify(accounts !== undefined))
   const server: Server = createServer((req, res) => {
     void handle(req, res)
   })
@@ -601,6 +688,18 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
           writeJson(res, 200, await providers.list())
           return
         }
+        if (path === '/api/accounts') {
+          if (!managementGate(req, nonce)) {
+            writeJson(res, 403, { error: 'request-not-trusted' })
+            return
+          }
+          if (accounts === undefined) {
+            writeJson(res, 404, { error: `no such route: ${req.method} ${path}` })
+            return
+          }
+          writeJson(res, 200, { accounts: await accounts.list() })
+          return
+        }
         writeJson(res, 404, { error: `no such route: ${req.method} ${path}` })
         return
       }
@@ -651,6 +750,42 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
         }
         return
       }
+      if (req.method === 'POST' && ACCOUNT_ROUTES.has(path ?? '')) {
+        // Same gate as provider management: the page nonce plus an exact
+        // origin match. These routes write and delete credential files, so
+        // they must not be reachable by a merely-loopback page.
+        if (!managementGate(req, nonce)) {
+          writeJson(res, 403, { error: 'request-not-trusted' })
+          return
+        }
+        if (accounts === undefined) {
+          // Absent means this bridge has no account surface at all, so the
+          // route does not exist for it — answering 501 would advertise a
+          // feature the operator turned off.
+          writeJson(res, 404, { error: `no such route: ${req.method} ${path}` })
+          return
+        }
+        const type = req.headers['content-type']
+        if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+          writeJson(res, 415, { error: 'Content-Type must be application/json' })
+          return
+        }
+        if (path === '/api/accounts/rescan') {
+          // No body needed; the scan reads the sources itself. The body limit
+          // is still applied so a huge payload cannot be used as a wedge.
+          await readBody(req, ACCOUNT_BODY_LIMIT)
+          writeJson(res, 200, await accounts.rescan())
+          return
+        }
+        const raw = await readBody(req, ACCOUNT_BODY_LIMIT)
+        if (path === '/api/accounts/import') {
+          const body = parseAccountImportBody(raw)
+          writeJson(res, 200, await accounts.import(body))
+        } else {
+          writeJson(res, 200, await accounts.remove(parseAccountRemoveBody(raw)))
+        }
+        return
+      }
       writeJson(res, 405, { error: 'method not allowed' })
     } catch (error: unknown) {
       if (error instanceof UiRequestError) {
@@ -671,7 +806,14 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
           writeJson(res, error.status, { error: error.message })
           return
         }
-        writeJson(res, 500, { error: 'provider management failed' })
+        if (error instanceof AccountStoreError) {
+          writeJson(res, error.status, { error: error.message })
+          return
+        }
+        // The generic answer stays route-specific: a page that sees "provider
+        // management failed" for a provider route is the contract this route
+        // has always had, and an account route says its own name.
+        writeJson(res, 500, { error: isAccountRoute(req) ? 'account management failed' : 'provider management failed' })
         return
       }
       logger?.warn('workbuddy-bridge: UI request failed', error)
@@ -683,8 +825,14 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
   /** Which paths are management, so their error handling is secrecy-first. */
   function isManagementRoute(req: IncomingMessage): boolean {
     const path = (req.url ?? '/').split('?')[0]
-    return req.method === 'GET' && path === '/api/providers'
+    return req.method === 'GET' && (path === '/api/providers' || path === '/api/accounts')
       || req.method === 'POST' && (path === '/api/providers/save' || path === '/api/providers/remove')
+      || isAccountRoute(req)
+  }
+
+  /** Whether this request addressed an account route. */
+  function isAccountRoute(req: IncomingMessage): boolean {
+    return req.method === 'POST' && ACCOUNT_ROUTES.has((req.url ?? '/').split('?')[0] ?? '')
   }
 
   /**
@@ -914,6 +1062,8 @@ const PAGE = `<!doctype html>
   <span class="spacer"></span>
   <span class="dim" id="updated"></span>
   <button id="refresh">Refresh</button>
+  <button id="rescan-accounts" hidden>Rescan accounts</button>
+  <button id="manage-accounts" hidden>Accounts</button>
   <button id="add-provider" hidden>Add provider</button>
 </header>
 <!-- Publication warning: lives outside #app so the poll rewrite can never
@@ -956,6 +1106,24 @@ const PAGE = `<!doctype html>
     </div>
   </div>
 </div>
+<div id="accounts-backdrop" class="dialog-backdrop" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="accounts-title">
+    <h2 id="accounts-title">Accounts</h2>
+    <div class="error-line" id="accounts-error" role="alert"></div>
+    <p class="confirm-sub">A stored sign-in file lets you keep an account in the pool, or take it out,
+       without touching the WorkBuddy app's own folder. Remove deletes only this bridge's copy.</p>
+    <div id="accounts-list"></div>
+    <label class="field"><span>Add a sign-in file</span>
+      <span class="hint">Choose a <code>workbuddy-desktop-ai*.info</code> file from this computer.
+        A file sealed by a different WorkBuddy install cannot be read here.</span>
+      <input id="accounts-file" type="file" accept=".info,application/json">
+    </label>
+    <div class="buttons">
+      <button id="accounts-close">Close</button>
+      <button id="accounts-import" class="primary">Add file</button>
+    </div>
+  </div>
+</div>
 <div id="remove-backdrop" class="dialog-backdrop" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="remove-title">
     <h2 id="remove-title">Remove provider</h2>
@@ -972,6 +1140,7 @@ const PAGE = `<!doctype html>
 <script>
 var UI_NONCE = "__UI_NONCE__";
 var MANAGE = "__MANAGE__";
+var MANAGE_ACCOUNTS = "__MANAGE_ACCOUNTS__";
 function esc(v) {
   return String(v).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -1373,6 +1542,8 @@ function render(state) {
   document.getElementById('version').textContent = 'v' + (state.version === 1 ? '1' : '?');
   document.getElementById('updated').textContent = 'updated ' + new Date(state.nowMs).toLocaleTimeString();
   document.getElementById('add-provider').hidden = !MANAGE;
+  document.getElementById('manage-accounts').hidden = !MANAGE_ACCOUNTS;
+  document.getElementById('rescan-accounts').hidden = !MANAGE_ACCOUNTS;
   var app = document.getElementById('app');
   if (!state.endpoints || !state.endpoints.length) {
     app.innerHTML = '<div class="notice">' + (MANAGE
@@ -1636,6 +1807,121 @@ function confirmRemove() {
       editorEl('remove-confirm').disabled = false;
     });
 }
+/*
+ * Account management: list the bridge's own sign-in copies, add one, remove
+ * one, and rescan the sources for an account that was signed in since the
+ * bridge started. The dialog lives outside #app for the same reason the
+ * provider editor does — the 5s poll rewrites #app and would drop the file
+ * input mid-selection.
+ */
+var storedAccounts = [];
+function openAccounts() {
+  editorEl('accounts-error').textContent = '';
+  editorEl('accounts-file').value = '';
+  document.getElementById('accounts-backdrop').hidden = false;
+  loadAccounts();
+}
+function closeAccounts() {
+  document.getElementById('accounts-backdrop').hidden = true;
+}
+function loadAccounts() {
+  if (!MANAGE_ACCOUNTS) return;
+  fetch('/api/accounts', { headers: { 'X-Bridge-Ui': UI_NONCE }, cache: 'no-store' })
+    .then(function (r) {
+      if (r.status === 200) return r.json();
+      throw new Error('HTTP ' + r.status);
+    })
+    .then(function (data) {
+      storedAccounts = (data && data.accounts) || [];
+      renderAccounts();
+    })
+    .catch(function (e) {
+      editorEl('accounts-error').textContent = 'Could not read the account folder: ' + e.message;
+    });
+}
+function renderAccounts() {
+  var host = document.getElementById('accounts-list');
+  if (!storedAccounts.length) {
+    host.innerHTML = '<p class="dim" style="font-size:12px;margin:0 0 12px;">'
+      + 'No stored accounts yet. The pool still uses every account the WorkBuddy app has signed in.</p>';
+    return;
+  }
+  var html = '<table class="models" style="margin-bottom:12px;"><thead><tr>'
+    + '<th>Account</th><th>Saved</th><th></th></tr></thead><tbody>';
+  for (var i = 0; i < storedAccounts.length; i++) {
+    var a = storedAccounts[i];
+    html += '<tr><td title="' + esc(a.uid) + '">' + esc(clip(a.uid, 26)) + '</td>'
+      + '<td class="dim">' + esc(fmtTime(a.savedAtMs) || 'unknown') + '</td>'
+      + '<td><button data-remove-account="' + esc(a.uid) + '">Remove</button></td></tr>';
+  }
+  html += '</tbody></table>';
+  host.innerHTML = html;
+  var buttons = host.querySelectorAll('button[data-remove-account]');
+  for (var b = 0; b < buttons.length; b++) {
+    buttons[b].addEventListener('click', function (event) {
+      removeAccount(event.currentTarget.getAttribute('data-remove-account'));
+    });
+  }
+}
+function removeAccount(uid) {
+  if (!uid) return;
+  editorEl('accounts-error').textContent = 'Removing...';
+  postManagement('/api/accounts/remove', { uid: uid })
+    .then(function () {
+      editorEl('accounts-error').textContent = '';
+      loadAccounts();
+      load();
+    })
+    .catch(function (message) {
+      editorEl('accounts-error').textContent = message;
+    });
+}
+function importAccount() {
+  var input = editorEl('accounts-file');
+  var file = input.files && input.files[0];
+  if (!file) {
+    editorEl('accounts-error').textContent = 'Choose a sign-in file first.';
+    return;
+  }
+  editorEl('accounts-error').textContent = 'Reading...';
+  var reader = new FileReader();
+  reader.onload = function () {
+    editorEl('accounts-error').textContent = 'Adding...';
+    postManagement('/api/accounts/import', { text: String(reader.result), origin: file.name })
+      .then(function () {
+        editorEl('accounts-error').textContent = '';
+        input.value = '';
+        loadAccounts();
+        load();
+      })
+      .catch(function (message) {
+        editorEl('accounts-error').textContent = message;
+      });
+  };
+  reader.onerror = function () {
+    editorEl('accounts-error').textContent = 'The file could not be read.';
+  };
+  reader.readAsText(file);
+}
+function rescanAccounts() {
+  var button = editorEl('rescan-accounts');
+  button.disabled = true;
+  postManagement('/api/accounts/rescan', {})
+    .then(function (result) {
+      var added = (result && result.added) || [];
+      button.textContent = added.length
+        ? 'Added ' + added.length
+        : 'No new accounts';
+      load();
+      setTimeout(function () { button.textContent = 'Rescan accounts'; }, 2500);
+    })
+    .catch(function (message) {
+      button.textContent = 'Rescan failed';
+      button.title = message;
+      setTimeout(function () { button.textContent = 'Rescan accounts'; button.title = ''; }, 4000);
+    })
+    .then(function () { button.disabled = false; });
+}
 function postManagement(path, body) {
   return fetch(path, {
     method: 'POST',
@@ -1674,6 +1960,10 @@ editorEl('editor-save').addEventListener('click', saveEditor);
 editorEl('remove-cancel').addEventListener('click', closeRemove);
 editorEl('remove-confirm').addEventListener('click', confirmRemove);
 editorEl('add-provider').addEventListener('click', function () { openEditor(null); });
+editorEl('manage-accounts').addEventListener('click', openAccounts);
+editorEl('accounts-close').addEventListener('click', closeAccounts);
+editorEl('accounts-import').addEventListener('click', importAccount);
+editorEl('rescan-accounts').addEventListener('click', rescanAccounts);
 /* Escape cancels whichever dialog is open; Tab is trapped inside it so focus
    cannot wander behind the backdrop. */
 document.addEventListener('keydown', function (event) {
@@ -1681,7 +1971,9 @@ document.addEventListener('keydown', function (event) {
   if (!openBackdrop) return;
   if (event.key === 'Escape') {
     event.preventDefault();
-    if (openBackdrop.id === 'editor-backdrop') closeEditor(); else closeRemove();
+    if (openBackdrop.id === 'editor-backdrop') closeEditor();
+    else if (openBackdrop.id === 'accounts-backdrop') closeAccounts();
+    else closeRemove();
     return;
   }
   if (event.key === 'Tab') {
