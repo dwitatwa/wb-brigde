@@ -8,7 +8,6 @@
  * @module dsh-workbuddy-connect/auth
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -188,96 +187,6 @@ function dedupeCandidates(candidates: readonly string[]): string[] {
  */
 export function desktopAuthCandidatesFor(variant: WorkBuddyVariant): string[] {
   return dedupeCandidates(defaultDesktopAuthCandidates().map(path => join(dirname(path), variant.desktopFilename)))
-}
-
-/** One discovered account: a file that holds a distinct signed-in identity. */
-export interface DiscoveredAccount {
-  /** Absolute path of the auth file or snapshot holding this account. */
-  path: string
-  /** Account uid parsed from the file; the deduplication key. */
-  uid: string
-}
-
-/**
- * Extract just the account identity from an auth document, without
- * decrypting anything.
- *
- * Discovery must not need the at-rest key: the desktop app encrypts the
- * token fields (and often the nickname) at rest, but `account.uid` and
- * `auth.domain` stay plaintext in both formats, and identity is all the
- * sweep needs to deduplicate and region-check. Returns `undefined` when no
- * plaintext uid is present.
- */
-function accountIdentityOfDocument(document: Record<string, unknown>): { uid: string; domain: string } | undefined {
-  const auth = typeof document['auth'] === 'object' && document['auth'] !== null ? document['auth'] as Record<string, unknown> : document
-  const identity = typeof document['account'] === 'object' && document['account'] !== null ? document['account'] as Record<string, unknown> : document
-  const uid = typeof identity['uid'] === 'string' ? identity['uid'] : ''
-  if (uid === '') return undefined
-  const domain = typeof auth['domain'] === 'string' ? auth['domain'] : ''
-  return { uid, domain }
-}
-
-/**
- * Every desktop auth file holding a distinct account for one variant.
- *
- * The desktop app rewrites its auth file through an atomic write that leaves
- * the previous copy behind as `workbuddy-desktop[-ai].<timestamp>.<pid>.<uuid>.info`,
- * so the directory accumulates one snapshot per sign-in event — which for a
- * machine that has used several accounts means one snapshot per account,
- * bearer tokens and all, sitting next to the live file. This sweep collects
- * the live file and every snapshot, keeps the newest copy per account uid,
- * and returns them oldest-first.
- *
- * Files that hold no recognizable document, no plaintext uid, or a credential
- * belonging to the other region are skipped rather than surfaced: the
- * credential store would refuse them anyway, and a dead endpoint helps
- * nobody. `searchDirs` stands in for the platform defaults in tests.
- */
-export function discoverDesktopAuthFiles(variant: WorkBuddyVariant, searchDirs?: readonly string[]): DiscoveredAccount[] {
-  const dirs = searchDirs ?? [...new Set(desktopAuthCandidatesFor(variant).map(path => dirname(path)))]
-  // `desktopFilename` carries the `.info` extension; the snapshots insert a
-  // timestamp block before it, so matching must anchor on the basename plus
-  // the separating dot — otherwise the CN sweep would also swallow the AI
-  // snapshots, whose basenames share the `workbuddy-desktop` prefix.
-  const base = variant.desktopFilename.replace(/\.info$/u, '')
-  const byUid = new Map<string, { path: string; uid: string; mtimeMs: number }>()
-  for (const dir of dirs) {
-    let names: string[]
-    try {
-      names = readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      // The live file exactly, or its snapshots `base.<timestamp>.<pid>.<uuid>.info`.
-      // The observation sidecars (`*.info.<uuid>.observation.json`) end in
-      // `.json`, so the suffix test alone separates them.
-      if (name !== variant.desktopFilename && !(name.startsWith(`${base}.`) && name.endsWith('.info'))) continue
-      const path = join(dir, name)
-      let identity: { uid: string; domain: string } | undefined
-      try {
-        if (!statSync(path).isFile()) continue
-        const text = readFileSync(path, 'utf8')
-        const classification = classifyDesktopAuthDocument(text)
-        if (classification.format === 'plaintext') {
-          const credential = parseWorkBuddyAuth(text)
-          if (credential !== undefined && credential.uid !== '') identity = { uid: credential.uid, domain: credential.domain }
-        } else if (classification.format === 'encrypted') {
-          identity = accountIdentityOfDocument(classification.wrapped.document)
-        }
-      } catch {
-        continue
-      }
-      if (identity === undefined) continue
-      if (regionOf(identity.domain) !== variant.region) continue
-      const mtimeMs = statSync(path).mtimeMs
-      const previous = byUid.get(identity.uid)
-      if (previous === undefined || mtimeMs > previous.mtimeMs) byUid.set(identity.uid, { path, uid: identity.uid, mtimeMs })
-    }
-  }
-  return [...byUid.values()]
-    .sort((a, b) => a.mtimeMs - b.mtimeMs)
-    .map(({ path, uid }) => ({ path, uid }))
 }
 
 /** First platform-default candidate; see {@link defaultDesktopAuthCandidates}. */

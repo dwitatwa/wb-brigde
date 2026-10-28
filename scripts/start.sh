@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Start the WorkBuddy Bridge with UI, failover pool, and all discovered accounts.
+# Start the WorkBuddy Bridge with UI and the WorkBuddy AI failover pool.
+# Only the WorkBuddy AI section is served; pass --provider both to add the
+# WorkBuddy (CN) section. Accounts join the pool only when their sign-in
+# file is uploaded in the UI.
 # Usage: ./scripts/start.sh [--wsl]
 
 set -e
@@ -14,7 +17,6 @@ if [[ "$1" == "--wsl" ]]; then
 fi
 
 exec node "$PROJECT_DIR/lib/run.js" ui \
-  --pool failover \
-  --all-accounts \
+  --provider ai \
   "${EXTRA_ARGS[@]}" \
   "$@"

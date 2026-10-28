@@ -6,10 +6,9 @@
  * The problem this solves is *ownership*, not portability. WorkBuddy's auth
  * directory belongs to the desktop app: the app writes it, rewrites it, and
  * leaves a snapshot behind on every sign-in. The bridge may read it, but it
- * must not delete from it, and it cannot keep an account out of rotation while
- * `--all-accounts` sweeps everything. A folder the bridge owns answers both:
- * the operator adds and removes accounts here, and the desktop directory stays
- * exactly as the app left it.
+ * must not delete from it, and it must not adopt accounts from it. A folder
+ * the bridge owns answers both: an account is in the pool because the operator
+ * uploaded its file here, and no account is in the pool for any other reason.
  *
  * **A stored file is a copy of a desktop auth file, not a new format.** That
  * is deliberate: the credential store already knows how to read both shapes
@@ -37,6 +36,7 @@ import {
   type WorkBuddyAtRestKeyProvider,
 } from '../core/desktop-credential-protection.ts'
 import { restrictDirToCurrentUser } from './windows-acl.ts'
+import { regionOf, type WorkBuddyRegion } from '../core/upstream.ts'
 
 /** Directory name under the bridge home holding stored account files. */
 export const ACCOUNT_STORE_DIRNAME = 'accounts'
@@ -57,6 +57,14 @@ export interface StoredAccount {
   savedAtMs: number
   /** Whether the stored document is a 5.6 at-rest envelope. */
   encrypted: boolean
+  /**
+   * Which product's upstream this sign-in belongs to, when it can be read.
+   *
+   * Absent means the document carried no domain, which is not a guess the
+   * store will make: such an account is offered to every variant and the
+   * credential store refuses it where it does not belong.
+   */
+  region?: WorkBuddyRegion
 }
 
 /** A management rejection with an HTTP status and a browser-safe message. */
@@ -70,12 +78,12 @@ export class AccountStoreError extends Error {
 /**
  * What the page can do with WorkBuddy accounts.
  *
- * Deliberately narrow: **list**, **import** one desktop sign-in file, **remove**
- * one stored account, and **rescan** the sources for accounts that appeared
- * since the bridge started. There is no "edit" — a sign-in file is a credential
- * blob, and changing it is not a page operation. There is also no way to reach
- * the desktop app's own directory: this surface only ever touches the bridge's
- * copy.
+ * Deliberately narrow: **list**, **import** one desktop sign-in file, and
+ * **remove** one stored account. There is no "edit" — a sign-in file is a
+ * credential blob, and changing it is not a page operation. There is also no
+ * way to reach the desktop app's own directory: this surface only ever touches
+ * the bridge's copy, and it never scans, so the pool's membership is exactly
+ * the set of files the operator uploaded.
  */
 export interface AccountManagement {
   /** The stored accounts, metadata only. */
@@ -87,8 +95,6 @@ export interface AccountManagement {
   import(input: { text: string, origin?: string }): Promise<StoredAccount>
   /** Remove one stored account; `removed: false` when it was not there. */
   remove(uid: string): Promise<{ removed: boolean, total: number }>
-  /** Pick up accounts that appeared since the last scan. */
-  rescan(): Promise<{ added: readonly string[], total: number }>
 }
 
 /** The sidecar recorded beside each stored file. Never holds a credential. */
@@ -112,6 +118,8 @@ export interface AccountCandidate {
   keyIds: readonly string[]
   /** Whether the document is an at-rest envelope. */
   encrypted: boolean
+  /** The upstream region the document's domain names, when it carries one. */
+  region?: WorkBuddyRegion
 }
 
 /** Options for {@link WorkBuddyAccountStore}. */
@@ -141,10 +149,12 @@ export function accountCandidateOf(text: string): AccountCandidate | undefined {
     if (document === undefined) return undefined
     const uid = plaintextUidOf(document)
     if (uid === undefined || !UID_PATTERN.test(uid)) return undefined
+    const region = plaintextRegionOf(document)
     return {
       uid,
       encrypted: classification.format === 'encrypted',
       keyIds: classification.format === 'encrypted' ? keyIdsOf(classification.wrapped.fields) : [],
+      ...region === undefined ? {} : { region },
     }
   }
   return undefined
@@ -175,6 +185,28 @@ function plaintextUidOf(document: Record<string, unknown>): string | undefined {
     : document
   const uid = identity['uid']
   return typeof uid === 'string' && uid !== '' ? uid : undefined
+}
+
+/**
+ * The plaintext upstream domain from either document shape, when present.
+ *
+ * `auth.domain` stays plaintext in both formats, so a stored account can be
+ * routed to the product it belongs to without decrypting anything. A document
+ * with no domain yields `undefined` rather than a default: guessing a region
+ * would put the account in a pool that cannot use it.
+ */
+function plaintextDomainOf(document: Record<string, unknown>): string | undefined {
+  const auth = typeof document['auth'] === 'object' && document['auth'] !== null
+    ? document['auth'] as Record<string, unknown>
+    : document
+  const domain = auth['domain']
+  return typeof domain === 'string' && domain !== '' ? domain : undefined
+}
+
+/** The region a document's domain names, when it names one. */
+function plaintextRegionOf(document: Record<string, unknown>): WorkBuddyRegion | undefined {
+  const domain = plaintextDomainOf(document)
+  return domain === undefined ? undefined : regionOf(domain)
 }
 
 /**
@@ -252,14 +284,31 @@ export class WorkBuddyAccountStore {
       const uid = name.slice(0, -ACCOUNT_FILE_SUFFIX.length)
       if (!UID_PATTERN.test(uid)) continue
       const metadata = await this.readMetadata(uid)
+      const stored = await this.readDocument(uid)
+      const region = stored?.document === undefined ? undefined : plaintextRegionOf(stored.document)
       accounts.push({
         uid,
         origin: metadata?.origin ?? '',
         savedAtMs: metadata?.savedAtMs ?? 0,
-        encrypted: await this.isEncrypted(uid),
+        encrypted: stored === undefined ? false : classifyDesktopAuthDocument(stored.text).format === 'encrypted',
+        ...region === undefined ? {} : { region },
       })
     }
     return accounts.sort((left, right) => left.savedAtMs - right.savedAtMs || left.uid.localeCompare(right.uid))
+  }
+
+  /**
+   * The paths of the stored accounts that belong to one product.
+   *
+   * A file whose region cannot be read is offered to every product, because
+   * the credential store is the authority on usability and it refuses a
+   * foreign file on its own. Offering a file to nobody would make an account
+   * the operator uploaded silently absent from every pool.
+   */
+  async pathsFor(region: WorkBuddyRegion): Promise<string[]> {
+    return (await this.list())
+      .filter(account => account.region === undefined || account.region === region)
+      .map(account => this.pathOf(account.uid))
   }
 
   /** The paths of every stored account, for the pool's membership. */
@@ -322,6 +371,7 @@ export class WorkBuddyAccountStore {
       origin: metadata.origin,
       savedAtMs: metadata.savedAtMs,
       encrypted: candidate.encrypted,
+      ...candidate.region === undefined ? {} : { region: candidate.region },
     }
   }
 
@@ -369,14 +419,25 @@ export class WorkBuddyAccountStore {
     }
   }
 
-  /** Whether the stored document is an at-rest envelope. */
-  private async isEncrypted(uid: string): Promise<boolean> {
+  /**
+   * The stored document's text and its parsed plaintext fields.
+   *
+   * Read once per account rather than twice: `list()` needs both the document
+   * shape (for `encrypted`) and the plaintext domain (for the region), and a
+   * credential folder is the last place to spend redundant reads.
+   */
+  private async readDocument(uid: string): Promise<{ text: string, document: Record<string, unknown> | undefined } | undefined> {
+    let text: string
     try {
-      const text = await readFile(this.pathOf(uid), 'utf8')
-      return classifyDesktopAuthDocument(text).format === 'encrypted'
+      text = await readFile(this.pathOf(uid), 'utf8')
     } catch {
-      return false
+      return undefined
     }
+    const classification = classifyDesktopAuthDocument(text)
+    const document = classification.format === 'plaintext'
+      ? plaintextDocumentOf(text)
+      : classification.format === 'encrypted' ? classification.wrapped.document : undefined
+    return { text, document }
   }
 }
 

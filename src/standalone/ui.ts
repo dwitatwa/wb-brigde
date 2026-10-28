@@ -294,8 +294,7 @@ export interface WorkBuddyUiOptions {
    */
   providers?: ProviderManagement
   /**
-   * WorkBuddy account management: the bridge-owned account folder, plus a
-   * rescan that picks up an account signed in since the bridge started.
+   * WorkBuddy account management: the bridge-owned account folder.
    *
    * Absent means the page shows no account controls at all — an embedder that
    * does not manage accounts keeps the read-only UI it had.
@@ -562,7 +561,6 @@ function parseRemoveBody(raw: string): { revision: string, id: string } {
  * the nonce.
  */
 const ACCOUNT_ROUTES: ReadonlySet<string> = new Set([
-  '/api/accounts/rescan',
   '/api/accounts/import',
   '/api/accounts/remove',
 ])
@@ -770,19 +768,11 @@ export function createWorkBuddyUiServer(options: WorkBuddyUiOptions): WorkBuddyU
           writeJson(res, 415, { error: 'Content-Type must be application/json' })
           return
         }
-        if (path === '/api/accounts/rescan') {
-          // No body needed; the scan reads the sources itself. The body limit
-          // is still applied so a huge payload cannot be used as a wedge.
-          await readBody(req, ACCOUNT_BODY_LIMIT)
-          writeJson(res, 200, await accounts.rescan())
-          return
-        }
-        const raw = await readBody(req, ACCOUNT_BODY_LIMIT)
         if (path === '/api/accounts/import') {
-          const body = parseAccountImportBody(raw)
+          const body = parseAccountImportBody(await readBody(req, ACCOUNT_BODY_LIMIT))
           writeJson(res, 200, await accounts.import(body))
         } else {
-          writeJson(res, 200, await accounts.remove(parseAccountRemoveBody(raw)))
+          writeJson(res, 200, await accounts.remove(parseAccountRemoveBody(await readBody(req, ACCOUNT_BODY_LIMIT))))
         }
         return
       }
@@ -1062,7 +1052,6 @@ const PAGE = `<!doctype html>
   <span class="spacer"></span>
   <span class="dim" id="updated"></span>
   <button id="refresh">Refresh</button>
-  <button id="rescan-accounts" hidden>Rescan accounts</button>
   <button id="manage-accounts" hidden>Accounts</button>
   <button id="add-provider" hidden>Add provider</button>
 </header>
@@ -1110,8 +1099,8 @@ const PAGE = `<!doctype html>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="accounts-title">
     <h2 id="accounts-title">Accounts</h2>
     <div class="error-line" id="accounts-error" role="alert"></div>
-    <p class="confirm-sub">A stored sign-in file lets you keep an account in the pool, or take it out,
-       without touching the WorkBuddy app's own folder. Remove deletes only this bridge's copy.</p>
+    <p class="confirm-sub">An account is in the pool only because its sign-in file was added here.
+       The bridge never scans the WorkBuddy app's own folder. Remove deletes only this bridge's copy.</p>
     <div id="accounts-list"></div>
     <label class="field"><span>Add a sign-in file</span>
       <span class="hint">Choose a <code>workbuddy-desktop-ai*.info</code> file from this computer.
@@ -1543,7 +1532,6 @@ function render(state) {
   document.getElementById('updated').textContent = 'updated ' + new Date(state.nowMs).toLocaleTimeString();
   document.getElementById('add-provider').hidden = !MANAGE;
   document.getElementById('manage-accounts').hidden = !MANAGE_ACCOUNTS;
-  document.getElementById('rescan-accounts').hidden = !MANAGE_ACCOUNTS;
   var app = document.getElementById('app');
   if (!state.endpoints || !state.endpoints.length) {
     app.innerHTML = '<div class="notice">' + (MANAGE
@@ -1808,9 +1796,9 @@ function confirmRemove() {
     });
 }
 /*
- * Account management: list the bridge's own sign-in copies, add one, remove
- * one, and rescan the sources for an account that was signed in since the
- * bridge started. The dialog lives outside #app for the same reason the
+ * Account management: list the bridge's own sign-in copies, add one, and
+ * remove one. There is no rescan: an account joins the pool only when its file
+ * is uploaded here. The dialog lives outside #app for the same reason the
  * provider editor does — the 5s poll rewrites #app and would drop the file
  * input mid-selection.
  */
@@ -1843,7 +1831,7 @@ function renderAccounts() {
   var host = document.getElementById('accounts-list');
   if (!storedAccounts.length) {
     host.innerHTML = '<p class="dim" style="font-size:12px;margin:0 0 12px;">'
-      + 'No stored accounts yet. The pool still uses every account the WorkBuddy app has signed in.</p>';
+      + 'No accounts yet. Add a sign-in file to put an account in the pool.</p>';
     return;
   }
   var html = '<table class="models" style="margin-bottom:12px;"><thead><tr>'
@@ -1903,25 +1891,6 @@ function importAccount() {
   };
   reader.readAsText(file);
 }
-function rescanAccounts() {
-  var button = editorEl('rescan-accounts');
-  button.disabled = true;
-  postManagement('/api/accounts/rescan', {})
-    .then(function (result) {
-      var added = (result && result.added) || [];
-      button.textContent = added.length
-        ? 'Added ' + added.length
-        : 'No new accounts';
-      load();
-      setTimeout(function () { button.textContent = 'Rescan accounts'; }, 2500);
-    })
-    .catch(function (message) {
-      button.textContent = 'Rescan failed';
-      button.title = message;
-      setTimeout(function () { button.textContent = 'Rescan accounts'; button.title = ''; }, 4000);
-    })
-    .then(function () { button.disabled = false; });
-}
 function postManagement(path, body) {
   return fetch(path, {
     method: 'POST',
@@ -1963,7 +1932,6 @@ editorEl('add-provider').addEventListener('click', function () { openEditor(null
 editorEl('manage-accounts').addEventListener('click', openAccounts);
 editorEl('accounts-close').addEventListener('click', closeAccounts);
 editorEl('accounts-import').addEventListener('click', importAccount);
-editorEl('rescan-accounts').addEventListener('click', rescanAccounts);
 /* Escape cancels whichever dialog is open; Tab is trapped inside it so focus
    cannot wander behind the backdrop. */
 document.addEventListener('keydown', function (event) {

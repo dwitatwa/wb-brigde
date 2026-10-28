@@ -355,7 +355,7 @@ Windows the search reads the uninstall registry, so it will report this if
 |---|---|
 | `serve` | start the bridge (default) |
 | `ui` | start the bridge **plus** the local web UI |
-| `start` | `ui` with `--all-accounts` (one command for the usual setup) |
+| `start` | `ui` with the failover pool (one command for the usual setup) |
 | `start:wsl` | `start` plus `--wsl` |
 | `test` | send one real chat turn through the running bridge, over both the loopback and WSL routes |
 | `models [--json]` | list the models the running bridge serves |
@@ -401,13 +401,20 @@ Add `--model <id>` to pin a model and `--json` for machine output.
 workbuddy-bridge ui      # or: pnpm ui
 ```
 
-For the usual setup with a failover pool and every discovered account, use the
-convenience command instead of spelling the flags out:
+For the usual setup with the failover pool, use the convenience command
+instead of spelling the flags out:
 
 ```sh
-pnpm start              # ui + --all-accounts
+pnpm start              # ui, WorkBuddy AI only
 pnpm start:wsl          # same, plus --wsl for WSL agents
 ```
+
+Both commands pass `--provider ai`, so the page shows only the **WorkBuddy AI**
+section. Pass `--provider both` to serve both products, or
+`workbuddy-bridge ui` with no flag for the same result.
+
+Accounts are not discovered. Add each one by uploading its sign-in file (see
+[The bridge-owned account folder](#the-bridge-owned-account-folder)).
 
 ```
 web UI: http://127.0.0.1:53803
@@ -545,10 +552,9 @@ code.
 
 | Flag | Effect |
 |---|---|
-| `--provider <cn\|ai\|both>` | which product(s) to serve (default `both`) |
+| `--provider <cn\|ai\|both>` | which product(s) to serve (default `both`; `ai` hides the WorkBuddy (CN) section) |
 | `--auth-file <path>` | explicit WorkBuddy (CN) desktop auth file; **repeatable** — each occurrence adds one account |
 | `--auth-file-ai <path>` | explicit WorkBuddy AI desktop auth file; **repeatable** — each occurrence adds one account |
-| `--all-accounts` | serve every account found in the desktop auth directory; explicit flags win for the product they name |
 | `--no-accounts-ui` | do not keep or expose the bridge-owned account folder (see [The bridge-owned account folder](#the-bridge-owned-account-folder)) |
 | `--home <dir>` | override the bridge home |
 | `--no-descriptor` | do not write the descriptor file |
@@ -582,37 +588,26 @@ identity file.
 
 ### Multiple accounts
 
-One process can serve several accounts of the same product — listed
-explicitly, or discovered automatically.
+One process can serve several accounts of the same product. An account joins a
+pool in one of two ways: it is uploaded to the bridge's own account folder, or
+it is named explicitly with `--auth-file*`.
 
-**Adding an account while the bridge runs.** The **Rescan accounts** button on
-the page repeats the account sources and starts one runtime for each account
-that is not served yet. The listener is never rebuilt, so the published base
-URL and token stay the same and a client configured once keeps working. Sign in
-to the new account in the desktop app, then press **Rescan accounts** — no
-restart.
+**The bridge never scans the desktop auth directory.** There is no
+`--all-accounts` flag and no automatic discovery. The pool's membership is
+exactly the set of accounts you added, so an account cannot enter rotation
+because the WorkBuddy app happened to leave a file behind.
 
-The **Accounts** button opens the bridge's own account folder (see
-[The bridge-owned account folder](#the-bridge-owned-account-folder)). There you
-can add a sign-in file and remove a stored account.
+**Adding an account while the bridge runs.** The **Accounts** button on the
+page opens the bridge's own account folder (see
+[The bridge-owned account folder](#the-bridge-owned-account-folder)). Choose a
+sign-in file and press **Add file**. The account joins the pool at once: the
+listener is never rebuilt, so the published base URL and token stay the same
+and a client configured once keeps working. No restart is needed.
 
-A rescan never *removes* a member: an account whose file is gone keeps its
-runtime and reports as signed out, the same state a sign-out produces. Use
-**Accounts → Remove** to take an account out of the pool.
-
-**Discovery (recommended).** The desktop app's atomic writes leave one
-snapshot per sign-in behind in its auth directory, so a machine that has used
-several accounts already holds a file for each. One flag serves them all:
-
-```sh
-workbuddy-bridge serve --wsl --all-accounts
-```
-
-The sweep collects the live file and every snapshot, keeps the newest copy
-per account, skips files that belong to the other product, and joins one
-account per file to the product's pool — no paths to type. Explicit
-`--auth-file*` flags win for the product they name, so a hand-picked list is
-never silently widened.
+**Removing an account.** Use **Accounts → Remove**. That deletes the bridge's
+own copy and drops the account from the pool immediately. The desktop app's
+file and its snapshots are never touched, so the account can be added back by
+uploading the same file again.
 
 **Explicit listing.** Repeat the auth-file flag once per account, in any
 order:
@@ -645,9 +640,9 @@ app once and copying `workbuddy-desktop.info` aside. Notes:
 
 The desktop auth directory belongs to the WorkBuddy app: the app writes it,
 rewrites it, and leaves a snapshot behind on every sign-in. The bridge may read
-it, but it must not delete from it, and it cannot keep an account out of
-rotation while `--all-accounts` sweeps everything. A folder the bridge owns
-answers both.
+it, but it must not delete from it. A folder the bridge owns is what makes the
+pool's membership the operator's choice: an account is in the pool because its
+file was uploaded here, and no account is in the pool for any other reason.
 
 It lives at `~/.workbuddy-bridge/accounts/`, one file per account named by the
 account's uid, `0600` inside a `0700` directory (with the Windows ACL pass where
@@ -655,15 +650,15 @@ mode bits cannot apply). Each file is a **verbatim copy** of a desktop sign-in
 document — the bridge never re-seals a token — with a sidecar `.json` holding
 only the origin and the save time.
 
-**Precedence.** Three sources, in order:
+**Precedence.** Two sources, in order:
 
 1. Explicit `--auth-file*` flags — a hand-picked list replaces everything else,
-   so a rescan never widens it.
+   so an upload never widens it.
 2. The bridge's own account folder.
-3. Desktop discovery (`--all-accounts`).
 
-Sources 2 and 3 are merged by account identity, so a stored copy and the
-desktop snapshot of the same sign-in are one member, not two.
+**There is no discovery.** The desktop app's auth directory is never scanned,
+so an account that is signed in to the desktop app but never uploaded stays out
+of the pool.
 
 **Add.** **Accounts → Add file** accepts a `workbuddy-desktop-ai*.info` file
 from this computer. The account joins the pool immediately.
@@ -690,11 +685,7 @@ Every product is served through **one pool endpoint per product** that draws
 on all of its accounts — there are no per-account endpoints beside it:
 
 ```sh
-workbuddy-bridge serve --wsl --all-accounts
-```
-
-```
-WorkBuddy AI · pool (failover)  http://127.0.0.1:51001/v1  27 models  token: ...
+workbuddy-bridge serve --wsl
 ```
 
 Point an agent at the pool's base URL and its requests stop depending on any

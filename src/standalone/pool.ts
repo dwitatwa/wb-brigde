@@ -139,8 +139,13 @@ export class WorkBuddyFailoverPool {
   /** Per-member traffic record, parallel to `members`. */
   private observed: WorkBuddyPoolMemberHealth[]
 
+  /**
+   * An empty membership is allowed: accounts arrive only by upload, so a pool
+   * exists before the first one does. Every request answers the shim's 401
+   * until a member is added, which is the same state a pool whose every
+   * account is signed out reports.
+   */
   constructor(members: readonly WorkBuddyPoolMember[]) {
-    if (members.length === 0) throw new Error('a failover pool needs at least one account')
     this.members = members
     this.observed = WorkBuddyFailoverPool.freshRecords(members.length)
   }
@@ -164,12 +169,11 @@ export class WorkBuddyFailoverPool {
    * edit. A member with no identity is matched by position, which is the
    * behaviour every caller had before membership could change.
    *
-   * An empty list is refused: a pool with no members has nothing to serve and
-   * would turn every request into an unexplained 500. Callers retire the
-   * endpoint instead.
+   * An empty list is accepted: the last account can be removed from the page,
+   * and the endpoint must survive that so the URL a client was configured with
+   * keeps working once an account is added again.
    */
   setMembers(members: readonly WorkBuddyPoolMember[]): void {
-    if (members.length === 0) throw new Error('a failover pool needs at least one account')
     const previous = this.members
     const carried = new Map<string, WorkBuddyPoolMemberHealth>()
     for (const [index, member] of previous.entries()) {
@@ -198,7 +202,7 @@ export class WorkBuddyFailoverPool {
       if (index < 0) this.headId = undefined
       return
     }
-    this.head = Math.min(this.head, members.length - 1)
+    this.head = members.length === 0 ? 0 : Math.min(this.head, members.length - 1)
   }
 
   /** How many accounts the pool can draw from. */

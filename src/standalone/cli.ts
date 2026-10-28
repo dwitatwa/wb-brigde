@@ -63,9 +63,6 @@ Options:
                             repeat to serve several CN accounts at once
   --auth-file-ai <path>     explicit WorkBuddy AI desktop auth file;
                             repeat to serve several AI accounts at once
-  --all-accounts            serve every account found in the desktop auth
-                            directory (explicit --auth-file* flags win for
-                            the product they name)
   --no-accounts-ui          do not keep or expose the bridge-owned account
                             folder, and show no account controls in the page
   --no-coalesce-reasoning   forward reasoning deltas exactly as the upstream
@@ -107,8 +104,6 @@ interface ParsedArgs {
   ui: boolean
   /** Also listen on the WSL switch address. */
   wsl: boolean
-  /** Discover and serve every account in the desktop auth directory. */
-  allAccounts: boolean
   /** Keep and expose the bridge-owned account folder. */
   accountsUi: boolean
   /** Forward reasoning deltas exactly as received. */
@@ -135,7 +130,6 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
     command: 'serve',
     ui: false,
     wsl: false,
-    allAccounts: false,
     accountsUi: true,
     noCoalesceReasoning: false,
     providerIds: [],
@@ -171,9 +165,6 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
         break
       case '--wsl':
         args.wsl = true
-        break
-      case '--all-accounts':
-        args.allAccounts = true
         break
       case '--no-accounts-ui':
         args.accountsUi = false
@@ -510,7 +501,6 @@ async function serve(args: ParsedArgs): Promise<void> {
     variants,
     ...providers.length === 0 ? {} : { providers },
     logger,
-    ...args.allAccounts ? { discoverAccounts: true } : {},
     ...args.noCoalesceReasoning ? { coalesceReasoning: false } : {},
     ...authFiles.size === 0 ? {} : { authFiles },
     // Managed providers are always on for the UI: the store loads the saved
@@ -608,19 +598,17 @@ async function serve(args: ParsedArgs): Promise<void> {
             return publishAfterMutation(bridge, runtime).then(() => snapshot)
           }),
         },
-        // WorkBuddy accounts: list, add, remove the bridge's own copies, and
-        // rescan for an account signed in since startup. A rescan adds pool
-        // members without rebuilding the listener, so the published base URL
-        // and token stay the same. `--no-accounts-ui` leaves this surface out
-        // entirely, so the page shows no controls and the routes do not exist.
+        // WorkBuddy accounts: list, add, and remove the bridge's own copies.
+        // An upload adds a pool member without rebuilding the listener, so the
+        // published base URL and token stay the same. `--no-accounts-ui` leaves
+        // this surface out entirely, so the page shows no controls and the
+        // routes do not exist.
         ...args.accountsUi ? {
           accounts: {
             list: () => bridge.listStoredAccounts(),
             import: (input: { text: string, origin?: string }) => bridge.importStoredAccount(input).then(account =>
               publishAfterMutation(bridge, runtime).then(() => account)),
             remove: (uid: string) => bridge.removeStoredAccount(uid).then(result =>
-              publishAfterMutation(bridge, runtime).then(() => result)),
-            rescan: () => bridge.rescanAccounts().then(result =>
               publishAfterMutation(bridge, runtime).then(() => result)),
           },
         } : {},

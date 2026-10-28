@@ -1,5 +1,8 @@
 @echo off
-rem Start the WorkBuddy Bridge with UI, failover pool, and all discovered accounts.
+rem Start the WorkBuddy Bridge with UI and the WorkBuddy AI failover pool.
+rem Only the WorkBuddy AI section is served; pass --provider both to add the
+rem WorkBuddy (CN) section. Accounts join the pool only when their sign-in
+rem file is uploaded in the UI.
 rem Usage: scripts\start.bat [--wsl]
 
 setlocal EnableDelayedExpansion
@@ -13,4 +16,4 @@ if "%1"=="--wsl" (
   shift
 )
 
-node "%PROJECT_DIR%\lib\run.js" ui --pool failover --all-accounts %EXTRA_ARGS% %*
+node "%PROJECT_DIR%\lib\run.js" ui --provider ai %EXTRA_ARGS% %*

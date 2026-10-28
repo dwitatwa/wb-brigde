@@ -48,7 +48,7 @@ async function upstream(status = 200, sse = false) {
 
 describe('custom provider bridge integration', () => {
   it('serves two providers through one pooled endpoint with a local token', async () => {
-    const { bridge, descriptor } = await start({ variants: [], providers: [provider('one'), provider('two')], discoverAccounts: true } as BridgeOptions)
+    const { bridge, descriptor } = await start({ variants: [], providers: [provider('one'), provider('two')] } as BridgeOptions)
     expect(descriptor.version).toBe(1)
     // The pool is the ONLY endpoint: no per-provider listeners exist.
     expect(descriptor.endpoints.map(ep => ep.provider)).toEqual(['custom-pool'])

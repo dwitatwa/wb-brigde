@@ -1,4 +1,4 @@
-import { A as UpstreamErrorKind, B as WorkBuddyUpstreamClient, D as WorkBuddyVariant, M as WorkBuddyChatResult, m as WorkBuddyCredentialStore, n as ShimLogger, p as WorkBuddyCredential, t as LoopbackEndpoint } from "./shim-C_F_ZwL7.js";
+import { A as UpstreamErrorKind, B as WorkBuddyUpstreamClient, D as WorkBuddyVariant, M as WorkBuddyChatResult, m as WorkBuddyCredentialStore, n as ShimLogger, p as WorkBuddyCredential, t as LoopbackEndpoint, z as WorkBuddyRegion } from "./shim-C_F_ZwL7.js";
 import { t as main } from "./cli-Cr0TbRBT.js";
 import { ServerResponse } from "node:http";
 //#region src/standalone/descriptor.d.ts
@@ -248,16 +248,24 @@ interface StoredAccount {
   savedAtMs: number;
   /** Whether the stored document is a 5.6 at-rest envelope. */
   encrypted: boolean;
+  /**
+   * Which product's upstream this sign-in belongs to, when it can be read.
+   *
+   * Absent means the document carried no domain, which is not a guess the
+   * store will make: such an account is offered to every variant and the
+   * credential store refuses it where it does not belong.
+   */
+  region?: WorkBuddyRegion;
 }
 /**
  * What the page can do with WorkBuddy accounts.
  *
- * Deliberately narrow: **list**, **import** one desktop sign-in file, **remove**
- * one stored account, and **rescan** the sources for accounts that appeared
- * since the bridge started. There is no "edit" — a sign-in file is a credential
- * blob, and changing it is not a page operation. There is also no way to reach
- * the desktop app's own directory: this surface only ever touches the bridge's
- * copy.
+ * Deliberately narrow: **list**, **import** one desktop sign-in file, and
+ * **remove** one stored account. There is no "edit" — a sign-in file is a
+ * credential blob, and changing it is not a page operation. There is also no
+ * way to reach the desktop app's own directory: this surface only ever touches
+ * the bridge's copy, and it never scans, so the pool's membership is exactly
+ * the set of files the operator uploaded.
  */
 interface AccountManagement {
   /** The stored accounts, metadata only. */
@@ -273,11 +281,6 @@ interface AccountManagement {
   /** Remove one stored account; `removed: false` when it was not there. */
   remove(uid: string): Promise<{
     removed: boolean;
-    total: number;
-  }>;
-  /** Pick up accounts that appeared since the last scan. */
-  rescan(): Promise<{
-    added: readonly string[];
     total: number;
   }>;
 }
@@ -550,6 +553,12 @@ declare class WorkBuddyFailoverPool {
   private members;
   /** Per-member traffic record, parallel to `members`. */
   private observed;
+  /**
+   * An empty membership is allowed: accounts arrive only by upload, so a pool
+   * exists before the first one does. Every request answers the shim's 401
+   * until a member is added, which is the same state a pool whose every
+   * account is signed out reports.
+   */
   constructor(members: readonly WorkBuddyPoolMember[]);
   /** One all-zero traffic record per member. */
   private static freshRecords;
@@ -561,9 +570,9 @@ declare class WorkBuddyFailoverPool {
    * edit. A member with no identity is matched by position, which is the
    * behaviour every caller had before membership could change.
    *
-   * An empty list is refused: a pool with no members has nothing to serve and
-   * would turn every request into an unexplained 500. Callers retire the
-   * endpoint instead.
+   * An empty list is accepted: the last account can be removed from the page,
+   * and the endpoint must survive that so the URL a client was configured with
+   * keeps working once an account is added again.
    */
   setMembers(members: readonly WorkBuddyPoolMember[]): void;
   /** How many accounts the pool can draw from. */
@@ -876,8 +885,7 @@ interface WorkBuddyUiOptions {
    */
   providers?: ProviderManagement;
   /**
-   * WorkBuddy account management: the bridge-owned account folder, plus a
-   * rescan that picks up an account signed in since the bridge started.
+   * WorkBuddy account management: the bridge-owned account folder.
    *
    * Absent means the page shows no account controls at all — an embedder that
    * does not manage accounts keeps the read-only UI it had.
@@ -947,28 +955,17 @@ interface BridgeOptions {
    * Several paths serve several accounts of the same product at once — each
    * becomes its own runtime with its own store, shim, port, and endpoint,
    * labelled by the account's nickname once the sweep has seen a credential.
-   * Absent (or empty) means the variant's usual desktop discovery.
+   * Absent (or empty) means the bridge's own account folder, and nothing else.
    */
   authFiles?: ReadonlyMap<string, readonly string[]>;
-  /**
-   * Serve every account the desktop auth directory holds, per variant.
-   *
-   * The app's atomic writes leave one snapshot per sign-in behind, so a
-   * machine that has used several accounts already has a file for each.
-   * Discovery collects them, keeps the newest per account uid, and starts one
-   * endpoint per account — no flags to repeat. Explicit `authFiles` for a
-   * variant win over discovery for that variant, so a hand-picked list is
-   * never silently widened.
-   */
-  discoverAccounts?: boolean;
   /**
    * Keep a bridge-owned account folder and expose it for management.
    *
    * The folder holds a copy of a desktop sign-in file per account, named by
-   * the account's uid. It exists so the operator can **remove** an account
-   * from the pool and keep an account **out** of rotation, neither of which is
-   * possible while the only source is the desktop app's own directory — the
-   * app owns those files, and `--all-accounts` sweeps everything it finds.
+   * the account's uid. It is the **only** way an account joins a pool: the
+   * bridge never sweeps the desktop app's auth directory, so the pool's
+   * membership is exactly the set of files the operator uploaded, and
+   * removing one takes that account out of rotation.
    *
    * Default false: an embedder that never manages accounts is unchanged.
    */
@@ -1252,59 +1249,51 @@ declare class WorkBuddyBridge {
    * the bridge's own account folder.
    *
    * Order matters, because the first account keeps the historical
-   * plugin-owned credential copy. Bridge-owned accounts come first: they are
-   * the operator's explicit choices, and a stored copy of an account is more
-   * authoritative than a snapshot the desktop app happened to leave behind.
+   * plugin-owned credential copy.
    *
-   * Three sources, in precedence order:
+   * Two sources, in precedence order:
    *
    * 1. Explicit `authFiles` for this variant — a hand-picked list replaces
-   *    everything else, exactly as before, so a caller that names its files is
-   *    never silently widened by a folder or a sweep.
+   *    everything else, so a caller that names its files is never widened by
+   *    the account folder.
    * 2. The bridge's own account folder, when `manageAccounts` is on.
-   * 3. Desktop discovery, when `discoverAccounts` is on.
    *
-   * Sources 2 and 3 are merged by account identity: a stored account and the
-   * desktop snapshot of the same sign-in are one member, not two, and the
-   * stored copy wins because the operator put it there.
+   * **Nothing is discovered.** The desktop app's auth directory is never
+   * swept, so an account joins a pool only when its sign-in file is uploaded,
+   * and the pool's membership is exactly the set the operator put there.
    *
-   * No paths at all means the variant's ordinary single-account mode — one
-   * runtime reading whatever the desktop app has signed in. `[undefined]` is
-   * that one entry; an empty array would start nothing, which is how the
-   * default invocation once regressed to "no variant could start an
-   * endpoint".
+   * An empty list is a real answer: the pool starts with no members and
+   * answers every request as signed out until the first upload.
    */
   private accountSourcesOf;
   /**
-   * The stored account files for one product, in save order.
+   * The stored account files belonging to one product, in save order.
    *
-   * The store is not per-variant on disk, so a file is offered to the variant
-   * whose region it belongs to. The store's own listing is metadata-only, and
-   * a region mismatch is caught later by the credential store — which is where
-   * it belongs, because only the parsed credential knows its domain.
+   * The store is not per-variant on disk, so a file is offered only to the
+   * product whose region its sign-in names. Without this filter every uploaded
+   * account became a member of **both** pools, so an AI account appeared in the
+   * CN pool as a permanently signed-out row.
+   *
+   * A file whose region cannot be read is offered to both: the credential
+   * store is the authority on usability and refuses a foreign file with a
+   * reason, which is a better outcome than an uploaded account vanishing.
    */
   private storedAccountPaths;
   /**
-   * Add every account that appeared since the last scan, without a restart.
+   * Start a runtime for every stored account not already served.
    *
-   * This is the page's **Rescan** action. It repeats the source list — the
-   * bridge's own folder and the desktop sweep — and starts one runtime for
-   * each account not already served, then hands the pool the new member list.
-   * The listener is never rebuilt, so the published base URL and token are
-   * unchanged.
+   * This is what makes an upload take effect without a restart: the file is
+   * already in the account folder, so the next call starts its runtime and
+   * hands the pool the new member list. The listener is never rebuilt, so the
+   * published base URL and token are unchanged.
    *
-   * A file already served is skipped by identity, so pressing the button twice
-   * adds nothing. Accounts that disappeared are **not** removed: a member whose
-   * file is gone keeps its runtime and simply reports as signed out, which is
-   * the same state a sign-out produces and keeps the head meaningful. Removing
-   * an account is an explicit action on the account folder.
+   * A file already served is skipped by path, so a repeated call adds nothing.
+   * Accounts that disappeared are **not** removed here: removing one is the
+   * page's explicit Remove action, which drops the runtime directly.
    *
-   * Returns what changed, for the caller to report.
+   * Returns how many runtimes were added.
    */
-  rescanAccounts(): Promise<{
-    added: string[];
-    total: number;
-  }>;
+  private addStoredAccounts;
   /** The live pool runtime for one product, when its endpoint is up. */
   /**
    * The pool members one variant's runtimes produce, in runtime order.
@@ -1316,6 +1305,15 @@ declare class WorkBuddyBridge {
    * has neither.
    */
   private poolMembersOf;
+  /**
+   * One pool endpoint per product, whether or not it has accounts yet.
+   *
+   * Accounts arrive only by upload, so a fresh bridge has none — and the pool
+   * must still exist, because the base URL and token an operator copies into
+   * a client have to survive the account being added later. With no members
+   * every request answers the shim's 401, which is the same state a pool whose
+   * accounts are all signed out reports.
+   */
   private startPools;
   /** The descriptor as of the last publish. */
   publish(): Promise<BridgeDescriptor>;

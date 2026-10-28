@@ -14,7 +14,7 @@
  * @module workbuddy-bridge/standalone/bridge
  */
 
-import { WorkBuddyCredentialStore, discoverDesktopAuthFiles, type WorkBuddyCredential } from '../core/auth.ts'
+import { WorkBuddyCredentialStore, type WorkBuddyCredential } from '../core/auth.ts'
 import {
   FALLBACK_WORKBUDDY_AI_MODELS,
   FALLBACK_WORKBUDDY_MODELS,
@@ -40,7 +40,6 @@ import {
   type WorkBuddyRequestRecord,
 } from './request-log.ts'
 import { join, basename } from 'node:path'
-import { readFileSync } from 'node:fs'
 import {
   loadEndpointIdentities,
   portOfBaseUrl,
@@ -130,30 +129,6 @@ function uidOfStoredPath(path: string): string {
   return name.endsWith('.info') ? name.slice(0, -'.info'.length) : name
 }
 
-/**
- * The account identity a discovered desktop file holds.
- *
- * The sweep already parsed these files to deduplicate them, but it returns
- * paths only, so this re-reads the one plaintext field it needs. A file that
- * cannot be read here contributes no identity and is therefore always added —
- * the credential store is the authority on whether it is usable.
- */
-function discoveredUidOf(path: string): string | undefined {
-  try {
-    const text = readFileSync(path, 'utf8')
-    const parsed: unknown = JSON.parse(text)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
-    const document = parsed as Record<string, unknown>
-    const identity = typeof document['account'] === 'object' && document['account'] !== null
-      ? document['account'] as Record<string, unknown>
-      : document
-    const uid = identity['uid']
-    return typeof uid === 'string' && uid !== '' ? uid : undefined
-  } catch {
-    return undefined
-  }
-}
-
 /** The static roster a variant serves before its first successful fetch. */
 function fallbackFor(variant: WorkBuddyVariant): readonly WorkBuddyModelInfo[] {
   return variant.id === CN_VARIANT.id ? FALLBACK_WORKBUDDY_MODELS : FALLBACK_WORKBUDDY_AI_MODELS
@@ -229,14 +204,13 @@ interface VariantRuntime {
   /** How many runtimes this variant serves; pool member labels use it. */
   accountTotal: number
   /**
-   * The auth file this runtime was created for, or undefined when it reads the
-   * desktop app's default location.
+   * The auth file this runtime was created for.
    *
-   * Kept so a rescan can tell which accounts are already served: the same file
-   * must not become a second member, and a member removed from the bridge must
-   * not come back merely because its file still exists.
+   * Kept so an upload can tell which accounts are already served: the same
+   * file must not become a second member, and a member removed from the page
+   * must not come back merely because its file is still on disk.
    */
-  authPath: string | undefined
+  authPath: string
   /** Whether this runtime came from the bridge's own account folder. */
   managedAccount: boolean
   /** The current credential's nickname, maintained by the sweep for labelling. */
@@ -272,28 +246,17 @@ export interface BridgeOptions {
    * Several paths serve several accounts of the same product at once — each
    * becomes its own runtime with its own store, shim, port, and endpoint,
    * labelled by the account's nickname once the sweep has seen a credential.
-   * Absent (or empty) means the variant's usual desktop discovery.
+   * Absent (or empty) means the bridge's own account folder, and nothing else.
    */
   authFiles?: ReadonlyMap<string, readonly string[]>
-  /**
-   * Serve every account the desktop auth directory holds, per variant.
-   *
-   * The app's atomic writes leave one snapshot per sign-in behind, so a
-   * machine that has used several accounts already has a file for each.
-   * Discovery collects them, keeps the newest per account uid, and starts one
-   * endpoint per account — no flags to repeat. Explicit `authFiles` for a
-   * variant win over discovery for that variant, so a hand-picked list is
-   * never silently widened.
-   */
-  discoverAccounts?: boolean
   /**
    * Keep a bridge-owned account folder and expose it for management.
    *
    * The folder holds a copy of a desktop sign-in file per account, named by
-   * the account's uid. It exists so the operator can **remove** an account
-   * from the pool and keep an account **out** of rotation, neither of which is
-   * possible while the only source is the desktop app's own directory — the
-   * app owns those files, and `--all-accounts` sweeps everything it finds.
+   * the account's uid. It is the **only** way an account joins a pool: the
+   * bridge never sweeps the desktop app's auth directory, so the pool's
+   * membership is exactly the set of files the operator uploaded, and
+   * removing one takes that account out of rotation.
    *
    * Default false: an embedder that never manages accounts is unchanged.
    */
@@ -613,14 +576,14 @@ export class WorkBuddyBridge {
       : await loadEndpointIdentities()
     const variants = this.options.variants ?? WORKBUDDY_VARIANTS
     for (const variant of variants) {
-      // One runtime per account. No explicit paths and no discovery means the
-      // variant's usual single-account desktop read, exactly as before;
-      // several paths — listed or discovered — means several simultaneous
-      // accounts, each with its own credential store and shim. The catalog
-      // store is deliberately shared across a variant's accounts: its entries
-      // are keyed by account identity, so one file (and one in-memory map)
-      // holds every account's saved roster without them clobbering each
-      // other on write.
+      // One runtime per account, and an account exists only because its
+      // sign-in file was uploaded or explicitly listed. A variant with none
+      // starts no runtime — its pool endpoint still comes up, so the URL and
+      // token an operator configures a client with survive the first upload.
+      // The catalog store is deliberately shared across a variant's accounts:
+      // its entries are keyed by account identity, so one file (and one
+      // in-memory map) holds every account's saved roster without them
+      // clobbering each other on write.
       const { paths, managed } = await this.accountSourcesOf(variant)
       const savedCatalogs = new WorkBuddyCatalogStore(workbuddyCatalogPath(variant.catalogFilename))
       const total = paths.length
@@ -631,11 +594,11 @@ export class WorkBuddyBridge {
           // overwrite the other's refreshed tokens. The first account keeps
           // the historical default so an existing copy is not orphaned.
           ...(index === 0 ? {} : { ownPath: join(resolveBridgeHome(), `.workbuddy-auth-${index + 1}.json`) }),
-          ...path === undefined ? {} : { desktopPath: path },
+          desktopPath: path,
           accountIndex: index + 1,
           accountTotal: total,
           savedCatalogs,
-          managedAccount: path !== undefined && managed.has(path),
+          managedAccount: managed.has(path),
         })
         if (runtime !== undefined) this.runtimes.push(runtime)
       }
@@ -926,7 +889,7 @@ export class WorkBuddyBridge {
         // check here is about this install, not about the region.
         keyProvider: atRestKeyProviderFor(variant),
       })
-      await this.rescanAccounts()
+      await this.addStoredAccounts()
       return account
     })
   }
@@ -1084,102 +1047,84 @@ export class WorkBuddyBridge {
    * the bridge's own account folder.
    *
    * Order matters, because the first account keeps the historical
-   * plugin-owned credential copy. Bridge-owned accounts come first: they are
-   * the operator's explicit choices, and a stored copy of an account is more
-   * authoritative than a snapshot the desktop app happened to leave behind.
+   * plugin-owned credential copy.
    *
-   * Three sources, in precedence order:
+   * Two sources, in precedence order:
    *
    * 1. Explicit `authFiles` for this variant — a hand-picked list replaces
-   *    everything else, exactly as before, so a caller that names its files is
-   *    never silently widened by a folder or a sweep.
+   *    everything else, so a caller that names its files is never widened by
+   *    the account folder.
    * 2. The bridge's own account folder, when `manageAccounts` is on.
-   * 3. Desktop discovery, when `discoverAccounts` is on.
    *
-   * Sources 2 and 3 are merged by account identity: a stored account and the
-   * desktop snapshot of the same sign-in are one member, not two, and the
-   * stored copy wins because the operator put it there.
+   * **Nothing is discovered.** The desktop app's auth directory is never
+   * swept, so an account joins a pool only when its sign-in file is uploaded,
+   * and the pool's membership is exactly the set the operator put there.
    *
-   * No paths at all means the variant's ordinary single-account mode — one
-   * runtime reading whatever the desktop app has signed in. `[undefined]` is
-   * that one entry; an empty array would start nothing, which is how the
-   * default invocation once regressed to "no variant could start an
-   * endpoint".
+   * An empty list is a real answer: the pool starts with no members and
+   * answers every request as signed out until the first upload.
    */
   private async accountSourcesOf(variant: WorkBuddyVariant): Promise<{
-    paths: ReadonlyArray<string | undefined>
+    paths: readonly string[]
     managed: ReadonlySet<string>
   }> {
     const explicit = this.options.authFiles?.get(variant.id) ?? []
     if (explicit.length > 0) return { paths: explicit, managed: new Set() }
 
-    const stored = this.accountStore === undefined ? [] : await this.storedAccountPaths(variant)
-    const discovered = this.options.discoverAccounts === true
-      ? discoverDesktopAuthFiles(variant).map(account => account.path)
-      : []
-    if (stored.length === 0 && discovered.length === 0) return { paths: [undefined], managed: new Set() }
-
-    // Deduplicate by the identity the sweep itself uses. A stored file's
-    // identity is its basename (the store names files by uid); a discovered
-    // file's is the uid the sweep parsed. Reading the stored file again would
-    // cost a decrypt, so the basename is taken as the identity.
-    const seen = new Set(stored.map(uidOfStoredPath))
-    const merged = [...stored]
-    for (const path of discovered) {
-      const uid = discoveredUidOf(path)
-      if (uid !== undefined && seen.has(uid)) continue
-      if (uid !== undefined) seen.add(uid)
-      merged.push(path)
-    }
-    return { paths: merged, managed: new Set(stored) }
+    const stored = await this.storedAccountPaths(variant)
+    return { paths: stored, managed: new Set(stored) }
   }
 
   /**
-   * The stored account files for one product, in save order.
+   * The stored account files belonging to one product, in save order.
    *
-   * The store is not per-variant on disk, so a file is offered to the variant
-   * whose region it belongs to. The store's own listing is metadata-only, and
-   * a region mismatch is caught later by the credential store — which is where
-   * it belongs, because only the parsed credential knows its domain.
+   * The store is not per-variant on disk, so a file is offered only to the
+   * product whose region its sign-in names. Without this filter every uploaded
+   * account became a member of **both** pools, so an AI account appeared in the
+   * CN pool as a permanently signed-out row.
+   *
+   * A file whose region cannot be read is offered to both: the credential
+   * store is the authority on usability and refuses a foreign file with a
+   * reason, which is a better outcome than an uploaded account vanishing.
    */
-  private async storedAccountPaths(_variant: WorkBuddyVariant): Promise<string[]> {
+  private async storedAccountPaths(variant: WorkBuddyVariant): Promise<string[]> {
     if (this.accountStore === undefined) return []
     try {
-      return await this.accountStore.paths()
+      return await this.accountStore.pathsFor(variant.region)
     } catch {
-      // An unreadable account folder must not stop the bridge: discovery and
-      // the desktop app's own file still serve.
+      // An unreadable account folder must not stop the bridge: an explicit
+      // `authFiles` list still serves, and the folder is retried on the next
+      // upload.
       return []
     }
   }
 
   /**
-   * Add every account that appeared since the last scan, without a restart.
+   * Start a runtime for every stored account not already served.
    *
-   * This is the page's **Rescan** action. It repeats the source list — the
-   * bridge's own folder and the desktop sweep — and starts one runtime for
-   * each account not already served, then hands the pool the new member list.
-   * The listener is never rebuilt, so the published base URL and token are
-   * unchanged.
+   * This is what makes an upload take effect without a restart: the file is
+   * already in the account folder, so the next call starts its runtime and
+   * hands the pool the new member list. The listener is never rebuilt, so the
+   * published base URL and token are unchanged.
    *
-   * A file already served is skipped by identity, so pressing the button twice
-   * adds nothing. Accounts that disappeared are **not** removed: a member whose
-   * file is gone keeps its runtime and simply reports as signed out, which is
-   * the same state a sign-out produces and keeps the head meaningful. Removing
-   * an account is an explicit action on the account folder.
+   * A file already served is skipped by path, so a repeated call adds nothing.
+   * Accounts that disappeared are **not** removed here: removing one is the
+   * page's explicit Remove action, which drops the runtime directly.
    *
-   * Returns what changed, for the caller to report.
+   * Returns how many runtimes were added.
    */
-  async rescanAccounts(): Promise<{ added: string[]; total: number }> {
+  private async addStoredAccounts(): Promise<number> {
     if (this.stopped) throw new UiRequestError(409, 'the bridge has stopped')
-    const added: string[] = []
+    let added = 0
     for (const pool of this.pools) {
       const variant = pool.variant
+      // An explicit list is the operator's own choice and is never widened by
+      // the folder, matching `accountSourcesOf`.
+      if ((this.options.authFiles?.get(variant.id) ?? []).length > 0) continue
       const { paths, managed } = await this.accountSourcesOf(variant)
       const known = new Set(pool.members.map(runtime => runtime.authPath).filter((path): path is string => path !== undefined))
       const savedCatalogs = new WorkBuddyCatalogStore(workbuddyCatalogPath(variant.catalogFilename))
       for (const path of paths) {
-        if (path === undefined || known.has(path)) continue
+        if (known.has(path)) continue
         const runtime = await this.startVariant(variant, {
           ownPath: join(resolveBridgeHome(), `.workbuddy-auth-${this.runtimes.length + 1}.json`),
           desktopPath: path,
@@ -1192,22 +1137,19 @@ export class WorkBuddyBridge {
         this.runtimes.push(runtime)
         pool.members.push(runtime)
         known.add(path)
-        added.push(path)
+        added += 1
       }
-      if (added.length > 0) {
+      if (added > 0) {
         // One membership update per pool: the router re-anchors the head by
         // identity, so live traffic stays on the account that was serving it.
         pool.pool.setMembers(this.poolMembersOf(pool.members))
       }
     }
-    if (added.length > 0) {
+    if (added > 0) {
       await this.syncAll()
       await this.publishToDisk()
     }
-    return {
-      added: added.map(path => basename(path)),
-      total: this.runtimes.length,
-    }
+    return added
   }
 
   /** The live pool runtime for one product, when its endpoint is up. */
@@ -1235,11 +1177,19 @@ export class WorkBuddyBridge {
     }))
   }
 
+  /**
+   * One pool endpoint per product, whether or not it has accounts yet.
+   *
+   * Accounts arrive only by upload, so a fresh bridge has none — and the pool
+   * must still exist, because the base URL and token an operator copies into
+   * a client have to survive the account being added later. With no members
+   * every request answers the shim's 401, which is the same state a pool whose
+   * accounts are all signed out reports.
+   */
   private async startPools(variants: readonly WorkBuddyVariant[]): Promise<void> {
     const logger = this.options.logger
     for (const variant of variants) {
       const members = this.runtimes.filter(runtime => runtime.variant.id === variant.id)
-      if (members.length === 0) continue
       const catalog = new WorkBuddyCatalog(fallbackFor(variant))
       if (variant.id !== CN_VARIANT.id) catalog.setUseMaximumContextWindow(true)
       catalog.setVisible(false)
@@ -1635,7 +1585,8 @@ export class WorkBuddyBridge {
     variant: WorkBuddyVariant,
     account: {
       ownPath?: string
-      desktopPath?: string
+      /** The sign-in file this runtime serves. Never the desktop default. */
+      desktopPath: string
       accountIndex: number
       accountTotal: number
       savedCatalogs: WorkBuddyCatalogStore
@@ -1645,7 +1596,7 @@ export class WorkBuddyBridge {
     const client = new WorkBuddyUpstreamClient()
     const store = new WorkBuddyCredentialStore({
       variant,
-      ...account.desktopPath === undefined ? {} : { desktopPath: account.desktopPath },
+      desktopPath: account.desktopPath,
       ...account.ownPath === undefined ? {} : { ownPath: account.ownPath },
       keyProvider: atRestKeyProviderFor(variant),
       refresh: credential => client.refreshToken(credential),

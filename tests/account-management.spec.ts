@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { sealAuthFieldForTest } from '../src/core/desktop-credential-protection.ts'
 import type { WorkBuddyCredential } from '../src/core/auth.ts'
 import type { WorkBuddyChatResult } from '../src/core/upstream.ts'
-import { AI_VARIANT } from '../src/core/variants.ts'
+import { AI_VARIANT, WORKBUDDY_VARIANTS } from '../src/core/variants.ts'
 import {
   ACCOUNT_STORE_DIRNAME,
   AccountStoreError,
@@ -158,9 +158,14 @@ describe('the failover pool with an editable membership', () => {
     expect(pool.headIndex()).toBe(1)
   })
 
-  it('refuses an empty membership rather than turning every request into a 500', () => {
+  it('accepts an empty membership, because the last account can be removed', async () => {
     const pool = new WorkBuddyFailoverPool([stubMember('a', [ok()]).member])
-    expect(() => pool.setMembers([])).toThrow(/at least one account/)
+    pool.setMembers([])
+    expect(pool.size).toBe(0)
+    expect(pool.headIndex()).toBe(0)
+    // With no member the shim's existence check fails, which is the 401 a
+    // pool whose accounts are all signed out already produces.
+    await expect(pool.resolve()).rejects.toThrow(/empty/)
   })
 })
 
@@ -259,7 +264,7 @@ async function desktopFile(nickname: string, uid: string): Promise<string> {
 }
 
 describe('adding an account without a restart', () => {
-  it('rescan adds a stored account, keeping the published URL and token', async () => {
+  it('an uploaded account joins the pool, keeping the published URL and token', async () => {
     const bridge = new WorkBuddyBridge({
       variants: [AI_VARIANT],
       manageAccounts: true,
@@ -268,21 +273,13 @@ describe('adding an account without a restart', () => {
     try {
       await bridge.start()
       const before = bridge.endpoints()[0]!
+      // Nothing is served yet: accounts arrive only by upload.
+      expect(before.signedIn).toBe(false)
 
-      // A sign-in file appears in the bridge's own folder — written directly
-      // here, because the import route's own rescan is a separate test.
-      await new WorkBuddyAccountStore().save({
-        text: authText('bob', 'uid-b'),
-        origin: 'uploaded',
-        keyProvider: keyProvider(''),
-      })
-
-      const result = await bridge.rescanAccounts()
-      expect(result.added).toEqual(['uid-b.info'])
-      expect(result.total).toBeGreaterThan(1)
+      await bridge.importStoredAccount({ text: authText('bob', 'uid-b'), origin: 'uploaded' })
 
       const labels = (await bridge.uiState()).endpoints[0]?.pool?.members.map(member => member.label)
-      expect(labels).toContain('bob')
+      expect(labels).toEqual(['bob'])
 
       // The listener was never rebuilt, so a client configured once keeps
       // working across the membership change.
@@ -294,7 +291,11 @@ describe('adding an account without a restart', () => {
     }
   })
 
-  it('rescan is idempotent: the same account is never added twice', async () => {
+  it('never adopts an account the operator did not upload', async () => {
+    // A desktop auth file exists in the temp home, but the bridge is not told
+    // about it: no --all-accounts, no --auth-file. Membership must stay empty,
+    // which is the whole point of removing the automatic scan.
+    await desktopFile('alice', 'uid-a')
     const bridge = new WorkBuddyBridge({
       variants: [AI_VARIANT],
       manageAccounts: true,
@@ -302,14 +303,46 @@ describe('adding an account without a restart', () => {
     })
     try {
       await bridge.start()
-      await new WorkBuddyAccountStore().save({
-        text: authText('bob', 'uid-b'),
-        origin: 'uploaded',
-        keyProvider: keyProvider(''),
+      const state = await bridge.uiState()
+      expect(state.endpoints[0]?.pool?.members).toEqual([])
+      expect(state.endpoints[0]?.signedIn).toBe(false)
+    } finally {
+      await bridge.close()
+    }
+  })
+
+  it('routes each uploaded account only to the pool of its own product', async () => {
+    // Both products served, so the two pools are both visible. A CN sign-in
+    // must not appear in the AI pool and vice versa: before this filter every
+    // upload joined both pools, and the foreign one showed a permanently
+    // signed-out member.
+    const bridge = new WorkBuddyBridge({
+      variants: WORKBUDDY_VARIANTS,
+      manageAccounts: true,
+      persistEndpointIdentity: false,
+    })
+    try {
+      await bridge.start()
+      await bridge.importStoredAccount({
+        text: JSON.stringify({
+          auth: { accessToken: 'tok-ai', expiresAt: 4_102_344_000, domain: 'www.workbuddy.ai' },
+          account: { nickname: 'aiacct', uid: 'uid-ai' },
+        }),
+        origin: 'ai.info',
+      })
+      await bridge.importStoredAccount({
+        text: JSON.stringify({
+          auth: { accessToken: 'tok-cn', expiresAt: 4_102_344_000, domain: 'copilot.tencent.com' },
+          account: { nickname: 'cnacct', uid: 'uid-cn' },
+        }),
+        origin: 'cn.info',
       })
 
-      await expect(bridge.rescanAccounts()).resolves.toMatchObject({ added: ['uid-b.info'] })
-      await expect(bridge.rescanAccounts()).resolves.toMatchObject({ added: [] })
+      const state = await bridge.uiState()
+      const labels = (id: string): string[] =>
+        state.endpoints.find(endpoint => endpoint.provider === id)?.pool?.members.map(member => member.label) ?? []
+      expect(labels('workbuddy-ai-pool')).toEqual(['aiacct'])
+      expect(labels('workbuddy-pool')).toEqual(['cnacct'])
     } finally {
       await bridge.close()
     }
@@ -331,9 +364,8 @@ describe('adding an account without a restart', () => {
         keyProvider: keyProvider(''),
       })
 
-      // A hand-picked list stays exactly what the operator named: a rescan
+      // A hand-picked list stays exactly what the operator named: an upload
       // must not add an account they did not select.
-      await expect(bridge.rescanAccounts()).resolves.toEqual({ added: [], total: 1 })
       const labels = (await bridge.uiState()).endpoints[0]?.pool?.members.map(member => member.label)
       expect(labels).toEqual(['alice'])
     } finally {
@@ -343,7 +375,7 @@ describe('adding an account without a restart', () => {
 })
 
 describe('the bridge-owned account folder', () => {
-  /** A bridge that discovers the temp home's files and manages accounts. */
+  /** A bridge over an explicit list of desktop files, with account management. */
   async function managedBridge(accounts: Array<[string, string]>): Promise<WorkBuddyBridge> {
     const paths: string[] = []
     for (const [nickname, uid] of accounts) paths.push(await desktopFile(nickname, uid))
@@ -396,11 +428,11 @@ describe('the bridge-owned account folder', () => {
     })
     try {
       await bridge.start()
-      // One runtime in the ordinary single-account mode, reading the desktop
-      // default — which does not exist in the temp home, so nothing is signed
-      // in yet.
+      // No account has been uploaded yet, so the pool has no members — but its
+      // endpoint is already up, which is what a client is configured with.
       const before = bridge.endpoints()[0]!
       expect(before.baseUrl).toBeTruthy()
+      expect(before.signedIn).toBe(false)
 
       const imported = await bridge.importStoredAccount({ text: authText('alice', 'uid-a'), origin: 'uploaded' })
       expect(imported.uid).toBe('uid-a')

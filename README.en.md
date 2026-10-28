@@ -22,16 +22,24 @@ restarts, so a client configured once keeps working; pass
 `--no-stable-endpoints` for a fresh pair on every start.
 `workbuddy-bridge models`, `status`, and `env` read the running descriptor.
 
+Two products can be served: **WorkBuddy AI** and **WorkBuddy** (CN). Use
+`--provider ai` to serve only WorkBuddy AI, so the page shows no WorkBuddy (CN)
+section. `pnpm start` and `pnpm start:wsl` pass it for you; `--provider both`
+serves both products.
+
 ## Add a WorkBuddy account
 
-Sign in to the account in the WorkBuddy desktop app, then press **Rescan
-accounts** in the web UI. The account joins the pool at once. The pool's base
-URL and token do not change, so your client configuration stays correct.
+Uploading a sign-in file is the only way to add an account. The bridge does not
+scan the WorkBuddy app's folder, so the pool holds exactly the accounts you add.
 
-The **Accounts** button opens a folder the bridge owns, one sign-in copy per
-account. Add a file there to keep an account, or remove one to take it out of
-the pool. Removing deletes only the bridge's copy; the WorkBuddy app's own
-files are never touched.
+Sign in to the account in the WorkBuddy desktop app, then press **Accounts** in
+the web UI and add the sign-in file. The account joins the pool at once. The
+pool's base URL and token do not change, so your client configuration stays
+correct.
+
+The **Accounts** dialog shows one sign-in copy per account. Add a file there to
+put an account in the pool, or remove one to take it out. Removing deletes only
+the bridge's copy; the WorkBuddy app's own files are never touched.
 
 A file sealed by a different WorkBuddy install cannot be read on this computer,
 because the encryption key is local to the install. Import checks this and
